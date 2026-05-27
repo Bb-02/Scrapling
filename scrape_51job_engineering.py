@@ -21,7 +21,6 @@ from search_api import (
     SearchAPIClient,
     PROVINCE_CODES,
     MAJOR_CITY_CODES,
-    parse_api_response,
 )
 
 # ============================================================
@@ -421,7 +420,6 @@ def _crawl_worker(
             real_chrome=True,
             network_idle=True,
             wait=3000,
-            capture_xhr=r"https://we\.51job\.com/api/job/search-pc.*",
             google_search=False,
             hide_canvas=True,
             block_webrtc=True,
