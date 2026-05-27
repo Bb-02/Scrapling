@@ -1,14 +1,16 @@
 """
 51job "工程/机械" 类别全国职位爬虫。
 
-策略: 浏览器 + XHR 拦截获取搜索 API JSON，子标签 × 地域多维度拆分，
-最大限度突破 51job 单次搜索 1,600 条限制。
+策略: 浏览器 + XHR 拦截获取搜索 API JSON，子标签 × 地域多维度拆分。
+支持多进程并发 + scout 剪枝，大幅提升效率。
 """
 
 import argparse
 import json
 import logging
+import multiprocessing as mp
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -34,10 +36,18 @@ PROGRESS_FILE = SCRIPT_DIR.parent / "crawl_progress.json"
 
 DEFAULT_PLATFORM = "前程无忧"
 DEFAULT_CATEGORY_L1 = "工程/机械"
-DEFAULT_JOB_AREA = "000000"  # 全国，但会被 IP 覆盖，实际用地域拆分
 DEFAULT_MAX_PAGES = 80
 
-# 工程/机械 下的子标签（从 51job 左侧筛选栏获取）
+# Scout provinces: test these first to decide if a keyword is worth full crawl
+SCOUT_AREAS: list[tuple[str, str]] = [
+    ("广东", "200000"),
+    ("江苏", "110000"),
+    ("浙江", "120000"),
+    ("北京", "010000"),
+    ("上海", "020000"),
+]
+
+# 工程/机械 下的子标签
 SUB_CATEGORIES = [
     "机械工程师",
     "机电工程师",
@@ -112,16 +122,23 @@ SUB_CATEGORIES = [
 ]
 
 
+def _worker_progress_file(worker_id: int) -> Path:
+    return OUTPUT_DIR / f"crawl_progress_w{worker_id}.json"
+
+
+def _worker_output_file(worker_id: int) -> Path:
+    return OUTPUT_DIR / f"worker_{worker_id}_output.xlsx"
+
+
 # ============================================================
 # 日志
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+def _setup_logger(worker_id: int | None = None):
+    prefix = f"[W{worker_id}] " if worker_id is not None else ""
+    fmt = f"%(asctime)s {prefix}%(levelname)s %(message)s"
+    logging.basicConfig(level=logging.INFO, format=fmt, datefmt="%H:%M:%S",
+                        stream=sys.stdout, force=True)
 
 
 # ============================================================
@@ -228,25 +245,20 @@ def infer_province(city: str) -> str:
 
 
 def parse_location(job_area_string: str) -> tuple[str, str]:
-    """从 jobAreaString 拆分城市和省。格式如 '广州·天河区' 或 '深圳'。"""
     if not job_area_string:
         return "", ""
     parts = re.split(r"[·\-]", job_area_string)
     city = parts[0].strip() if parts else ""
     province = infer_province(city)
-    # 直辖市处理
     if city in ("北京", "上海", "天津", "重庆"):
         province = city + "市"
     return province, city
 
 
 def parse_job_description(job_describe: str) -> tuple[str, str]:
-    """拆分职位描述为工作内容和任职要求。"""
     if not job_describe:
         return "", ""
-
     text = str(job_describe)
-    # 常见分隔模式
     requirement_pattern = re.compile(
         r"(任职要求|任职资格|职位要求|岗位要求|应聘要求|资格要求|任职条件)[:：】\]\s]*"
     )
@@ -272,11 +284,9 @@ def read_template_columns() -> list[str]:
 
 
 def build_row(idx: int, item: dict) -> dict:
-    """将 API 数据转为模板 Excel 行。"""
     province, city = parse_location(item.get("jobAreaString", ""))
     work_content, requirements = parse_job_description(item.get("jobDescribe", ""))
 
-    # 福利标签
     welfare = item.get("welfareList", [])
     if isinstance(welfare, list) and welfare:
         if isinstance(welfare[0], dict):
@@ -289,7 +299,6 @@ def build_row(idx: int, item: dict) -> dict:
     else:
         welfare_str = ""
 
-    # 子标签
     tags = item.get("jobTags", [])
     if isinstance(tags, list):
         tags_str = " / ".join(
@@ -299,7 +308,6 @@ def build_row(idx: int, item: dict) -> dict:
     else:
         tags_str = str(tags) if tags else ""
 
-    # 岗位类型二级
     func_types = []
     for k in ("industryType1", "industryType2"):
         v = item.get(k, "")
@@ -335,22 +343,24 @@ def build_row(idx: int, item: dict) -> dict:
 
 
 # ============================================================
-# 断点续爬
+# 进度管理
 # ============================================================
 
-def load_progress() -> dict:
-    if not PROGRESS_FILE.exists():
-        return {"keyword_idx": 0, "area_idx": 0, "total": 0}
+def _load_progress(filepath: Path) -> dict:
+    if not filepath.exists():
+        return {"keyword_idx": 0, "area_idx": 0, "total": 0, "phase": "scout"}
     try:
-        return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+        return json.loads(filepath.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, FileNotFoundError):
-        return {"keyword_idx": 0, "area_idx": 0, "total": 0}
+        return {"keyword_idx": 0, "area_idx": 0, "total": 0, "phase": "scout"}
 
 
-def save_progress(keyword_idx: int, area_idx: int, total: int) -> None:
-    PROGRESS_FILE.write_text(
+def _save_progress(filepath: Path, keyword_idx: int, area_idx: int, total: int,
+                   phase: str) -> None:
+    filepath.write_text(
         json.dumps(
-            {"keyword_idx": keyword_idx, "area_idx": area_idx, "total": total},
+            {"keyword_idx": keyword_idx, "area_idx": area_idx, "total": total,
+             "phase": phase},
             ensure_ascii=False, indent=2,
         ),
         encoding="utf-8",
@@ -358,7 +368,251 @@ def save_progress(keyword_idx: int, area_idx: int, total: int) -> None:
 
 
 # ============================================================
-# 主流程
+# 爬虫核心逻辑 (module-level, for multiprocessing on Windows)
+# ============================================================
+
+def _crawl_worker(
+    worker_id: int,
+    keywords: list[str],
+    areas: list[tuple[str, str]],
+    scout_areas: list[tuple[str, str]],
+    max_pages: int,
+):
+    """单个 worker 进程的入口。拥有独立的浏览器和进度文件。"""
+    _setup_logger(worker_id)
+    logger = logging.getLogger(__name__)
+    logger.info("启动, %d 个关键词", len(keywords))
+
+    progress_path = _worker_progress_file(worker_id)
+    progress = _load_progress(progress_path)
+    ki = progress.get("keyword_idx", 0)
+    ai = progress.get("area_idx", 0)
+    phase = progress.get("phase", "scout")
+    all_rows: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # 计算非 scout 省份 (full phase 用的 areas)
+    scout_codes = {code for _, code in scout_areas}
+    full_areas = [(n, c) for n, c in areas if c not in scout_codes]
+
+    if ki >= len(keywords):
+        logger.info("所有关键词已完成")
+        _save_worker_output(worker_id, all_rows)
+        return
+
+    client = SearchAPIClient(headless=True, timeout=60000)
+
+    try:
+        with StealthySession(
+            headless=True,
+            solve_cloudflare=True,
+            real_chrome=True,
+            network_idle=True,
+            wait=3000,
+            capture_xhr=r"https://we\.51job\.com/api/job/search-pc.*",
+            google_search=False,
+            hide_canvas=True,
+            block_webrtc=True,
+        ) as session:
+            while ki < len(keywords):
+                keyword = keywords[ki]
+
+                if phase == "scout":
+                    _run_phase(
+                        worker_id, session, client, keyword,
+                        scout_areas, ki, ai, max_pages,
+                        all_rows, seen_ids, progress_path, "scout",
+                    )
+                    # 判断 scout 是否通过: 检查此次 scout 是否有新增数据
+                    scout_before = len(all_rows)
+                    # scout 数据已经加进去了，检查本 keyword 是否有任何产出
+                    # 简单判断: 只要针对本 keyword 的 scout 轮次有新数据就算通过
+                    # 重新计算: 看本次 scout 覆盖的 area 中是否有结果
+                    # 实际做法: 看所有本 keyword 的搜索结果总数
+                    scout_passed = _check_scout_passed(
+                        session, client, keyword, scout_areas,
+                    )
+                    if scout_passed:
+                        logger.info("[%s] scout 通过，进入全量阶段 (%d 省)",
+                                    keyword, len(full_areas))
+                        phase = "full"
+                        ai = 0
+                    else:
+                        logger.info("[%s] scout 未通过，跳过此关键词", keyword)
+                        ki += 1
+                        ai = 0
+                        phase = "scout"
+                    _save_progress(progress_path, ki, ai, len(all_rows), phase)
+
+                elif phase == "full":
+                    _run_phase(
+                        worker_id, session, client, keyword,
+                        full_areas, ki, ai, max_pages,
+                        all_rows, seen_ids, progress_path, "full",
+                    )
+                    ki += 1
+                    ai = 0
+                    phase = "scout"
+                    _save_progress(progress_path, ki, ai, len(all_rows), phase)
+
+                # 定期保存
+                if len(all_rows) % 500 == 0 and all_rows:
+                    _save_worker_output(worker_id, all_rows)
+
+    except KeyboardInterrupt:
+        logger.warning("用户中断")
+        _save_progress(progress_path, ki, ai, len(all_rows), phase)
+        _save_worker_output(worker_id, all_rows)
+    except Exception:
+        logger.exception("异常退出")
+        _save_progress(progress_path, ki, ai, len(all_rows), phase)
+        _save_worker_output(worker_id, all_rows)
+        raise
+
+    _save_progress(progress_path, ki, ai, len(all_rows), phase)
+    _save_worker_output(worker_id, all_rows)
+    logger.info("完成: %d 条数据", len(all_rows))
+
+
+def _check_scout_passed(
+    session: StealthySession,
+    client: SearchAPIClient,
+    keyword: str,
+    scout_areas: list[tuple[str, str]],
+) -> bool:
+    """检查 scout 阶段是否有任何 area 返回了数据。
+
+    由于 search_all_pages 已运行过，数据已在 all_rows 中。
+    这里快速检查 keyword 在任意 scout area 的总 count。
+    """
+    # 快速验证: 取第一个 scout area 看是否返回了数据
+    # 实际上数据已在上一轮被收集，这里重新快速查询第一个 area 即可
+    # 如果第一个 area 返回 0，再检查其他 area
+    for area_name, area_code in scout_areas:
+        try:
+            # 只查第 1 页即可判断
+            import json as _json
+            from urllib.parse import urlencode as _urlencode
+            data = None
+            captured = []
+
+            def _setup(page):
+                def _on_response(response):
+                    if "/api/job/search-pc" in response.url and response.status == 200:
+                        try:
+                            body = response.body()
+                            if b"aliyun_waf" not in body:
+                                captured.append(_json.loads(body))
+                        except Exception:
+                            pass
+                page.on("response", _on_response)
+
+            def _action(page):
+                for _ in range(20):
+                    if captured:
+                        break
+                    page.wait_for_timeout(300)
+
+            params = {"keyword": keyword, "searchType": "2", "pageNum": "1",
+                       "jobArea": area_code}
+            url = f"https://we.51job.com/pc/search?{_urlencode(params)}"
+            session.fetch(url, page_setup=_setup, page_action=_action,
+                          network_idle=True, wait=200)
+            if captured:
+                total = captured[0].get("resultbody", {}).get("job", {}).get("totalCount", 0)
+                if total > 0:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _run_phase(
+    worker_id: int,
+    session: StealthySession,
+    client: SearchAPIClient,
+    keyword: str,
+    areas: list[tuple[str, str]],
+    ki: int,
+    ai_start: int,
+    max_pages: int,
+    all_rows: list[dict],
+    seen_ids: set[str],
+    progress_path: Path,
+    phase: str,
+):
+    """执行一轮 area 遍历，从 ai_start 开始。"""
+    logger = logging.getLogger(__name__)
+    for ai in range(ai_start, len(areas)):
+        area_name, area_code = areas[ai]
+        logger.info("[%d/%d] %s @ %s(%s)",
+                    ki + 1, -1, keyword, area_name, area_code)
+
+        items = client.search_all_pages(
+            session, keyword, area_code, max_pages=max_pages,
+        )
+
+        new_count = 0
+        for item in items:
+            jid = item.get("jobHref", "") or item.get("jobId", "")
+            if jid and jid not in seen_ids:
+                seen_ids.add(jid)
+                all_rows.append(build_row(len(all_rows) + 1, item))
+                new_count += 1
+
+        logger.info("-> %s@%s: 新增 %d, 累计 %d",
+                    keyword, area_name, new_count, len(all_rows))
+        _save_progress(progress_path, ki, ai + 1, len(all_rows), phase)
+
+
+def _save_worker_output(worker_id: int, rows: list[dict]):
+    if not rows:
+        return
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = _worker_output_file(worker_id)
+    columns = read_template_columns()
+    df = pd.DataFrame(rows, columns=columns)
+    df.to_excel(path, index=False, sheet_name="Sheet1")
+    logger = logging.getLogger(__name__)
+    logger.info("Worker %d 输出: %s (%d 条)", worker_id, path, len(rows))
+
+
+def _merge_worker_outputs(workers: int, output_dir: Path):
+    """合并所有 worker 的输出文件。"""
+    logger = logging.getLogger(__name__)
+    all_rows: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for w in range(workers):
+        path = _worker_output_file(w)
+        if not path.exists():
+            logger.warning("Worker %d 输出文件不存在: %s", w, path)
+            continue
+        try:
+            df = pd.read_excel(path)
+            for _, row in df.iterrows():
+                jid = str(row.get("岗位链接", ""))
+                if jid and jid not in seen_ids:
+                    seen_ids.add(jid)
+                    all_rows.append(row.to_dict())
+            logger.info("Worker %d: %d 条 (去重后)", w, len(all_rows))
+        except Exception as e:
+            logger.error("读取 Worker %d 输出失败: %s", w, e)
+
+    if not all_rows:
+        logger.warning("没有数据可合并")
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = output_dir / f"51job_engineering_merged_{stamp}.xlsx"
+    columns = read_template_columns()
+    df = pd.DataFrame(all_rows, columns=columns)
+    df.to_excel(path, index=False, sheet_name="Sheet1")
+    logger.info("合并完成: %s (%d 条)", path, len(all_rows))
+
+
+# ============================================================
+# 主入口
 # ============================================================
 
 def main():
@@ -367,20 +621,15 @@ def main():
                         help="指定子标签，默认使用内置列表")
     parser.add_argument("--areas", type=str, default="provinces",
                         choices=["provinces", "cities", "both"],
-                        help="地域拆分级别: provinces=省级(默认), cities=城市级, both=两者")
+                        help="地域拆分级别")
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
-    parser.add_argument("--resume", action="store_true", default=False,
-                        help="从断点继续")
-    parser.add_argument("--limit-keywords", type=int, default=0,
-                        help="限制子标签数量（测试用）")
-    parser.add_argument("--limit-areas", type=int, default=0,
-                        help="限制地域数量（测试用）")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="并行浏览器进程数 (默认 1)")
+    parser.add_argument("--no-scout", action="store_true", default=False,
+                        help="关闭 scout 剪枝，强制全量搜索")
     args = parser.parse_args()
 
-    # 准备搜索列表
     keywords = args.keywords if args.keywords else SUB_CATEGORIES
-    if args.limit_keywords > 0:
-        keywords = keywords[:args.limit_keywords]
 
     if args.areas == "provinces":
         areas = list(PROVINCE_CODES.items())
@@ -389,117 +638,56 @@ def main():
     else:
         areas = list(PROVINCE_CODES.items()) + list(MAJOR_CITY_CODES.items())
 
-    if args.limit_areas > 0:
-        areas = areas[:args.limit_areas]
-
-    # 断点续爬
-    progress = load_progress()
-    start_ki = progress.get("keyword_idx", 0) if args.resume else 0
-    start_ai = progress.get("area_idx", 0) if args.resume else 0
-    all_rows: list[dict] = progress.get("rows", []) if args.resume else []
-
-    logger.info(
-        "配置: %d 子标签 × %d 地域, 最多 %d 页/搜索",
-        len(keywords), len(areas), args.max_pages,
-    )
-    if args.resume and start_ki > 0:
-        logger.info("从断点恢复: keyword_idx=%d, area_idx=%d, 已累计 %d 条",
-                     start_ki, start_ai, len(all_rows))
-
-    # 爬取
-    client = SearchAPIClient(headless=True, timeout=60000)
-    seen_job_ids: set[str] = {row.get("岗位链接", "") for row in all_rows if row.get("岗位链接")}
+    scout_areas = [] if args.no_scout else SCOUT_AREAS
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    ki = start_ki
-    ai = start_ai
-    try:
-        with StealthySession(
-            headless=True,
-            solve_cloudflare=True,
-            real_chrome=True,
-            network_idle=True,
-            wait=3000,
-            timeout=60000,
-            capture_xhr=r"https://we\.51job\.com/api/job/search-pc.*",
-            google_search=False,
-            hide_canvas=True,
-            block_webrtc=True,
-        ) as session:
-            for ki in range(start_ki, len(keywords)):
-                keyword = keywords[ki]
-                ai_start = start_ai if ki == start_ki else 0
+    if args.workers > 1:
+        _setup_logger(None)
+        logger = logging.getLogger(__name__)
+        logger.info("启动 %d 个 worker 进程", args.workers)
+        logger.info("Scout: %s", "关闭" if args.no_scout else "启用")
 
-                for ai in range(ai_start, len(areas)):
-                    area_name, area_code = areas[ai]
-                    logger.info("=== [%d/%d] %s @ %s(%s) ===",
-                                ki + 1, len(keywords), keyword, area_name, area_code)
+        # 分片: 轮流分配关键词给各 worker
+        shards: list[list[str]] = [[] for _ in range(args.workers)]
+        for i, kw in enumerate(keywords):
+            shards[i % args.workers].append(kw)
 
-                    items = client.search_all_pages(
-                        session, keyword, area_code,
-                        max_pages=args.max_pages,
-                    )
+        processes = []
+        for w_id, shard in enumerate(shards):
+            if not shard:
+                continue
+            logger.info("Worker %d: %d 个关键词 (%s ... %s)",
+                        w_id, len(shard), shard[0], shard[-1])
+            p = mp.Process(
+                target=_crawl_worker,
+                args=(w_id, shard, areas, scout_areas, args.max_pages),
+            )
+            p.start()
+            processes.append(p)
 
-                    new_count = 0
-                    for item in items:
-                        jid = item.get("jobHref", "") or item.get("jobId", "")
-                        if jid and jid not in seen_job_ids:
-                            seen_job_ids.add(jid)
-                            all_rows.append(build_row(len(all_rows) + 1, item))
-                            new_count += 1
+        try:
+            for p in processes:
+                p.join()
+        except KeyboardInterrupt:
+            logger.warning("收到中断信号，等待子进程退出...")
+            for p in processes:
+                p.terminate()
+            for p in processes:
+                p.join()
+            logger.info("所有子进程已退出")
 
-                    logger.info(
-                        "-> %s@%s: 新增 %d, 累计 %d 条",
-                        keyword, area_name, new_count, len(all_rows),
-                    )
+        # 合并
+        logger.info("合并各 worker 输出...")
+        _merge_worker_outputs(args.workers, OUTPUT_DIR)
 
-                    save_progress(ki, ai + 1, len(all_rows))
-
-                    # 定期保存中间结果
-                    if len(all_rows) % 500 == 0 and all_rows:
-                        _save_intermediate(all_rows)
-
-    except KeyboardInterrupt:
-        logger.info("用户中断，保存当前进度...")
-        save_progress(ki, ai, len(all_rows))
-        _save_intermediate(all_rows)
-        logger.info("进度已保存，共 %d 条", len(all_rows))
-        return
-    except Exception:
-        logger.exception("爬取异常，保存进度...")
-        save_progress(ki, ai, len(all_rows))
-        _save_intermediate(all_rows)
-        raise
-
-    # 最终保存
-    if not all_rows:
-        logger.warning("未获取到任何数据")
-        return
-
-    _save_final(all_rows)
-    PROGRESS_FILE.unlink(missing_ok=True)
-    logger.info("全部完成!")
-
-
-def _save_intermediate(rows: list[dict]) -> None:
-    """保存中间结果。"""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = OUTPUT_DIR / f"51job_engineering_partial_{stamp}.xlsx"
-    columns = read_template_columns()
-    df = pd.DataFrame(rows, columns=columns)
-    df.to_excel(path, index=False, sheet_name="Sheet1")
-    logger.info("中间结果已保存: %s (%d 条)", path, len(rows))
-
-
-def _save_final(rows: list[dict]) -> None:
-    """保存最终结果。"""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = OUTPUT_DIR / f"51job_engineering_{stamp}.xlsx"
-    columns = read_template_columns()
-    df = pd.DataFrame(rows, columns=columns)
-    df.to_excel(path, index=False, sheet_name="Sheet1")
-    logger.info("最终结果: %s (%d 条)", path, len(rows))
+    else:
+        # 单进程模式
+        _setup_logger(None)
+        logger = logging.getLogger(__name__)
+        logger.info("单进程模式, %d 关键词, %d 地域", len(keywords), len(areas))
+        logger.info("Scout: %s", "关闭" if args.no_scout else "启用")
+        _crawl_worker(0, keywords, areas, scout_areas, args.max_pages)
 
 
 if __name__ == "__main__":
