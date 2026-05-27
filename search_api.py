@@ -161,46 +161,120 @@ class SearchAPIClient:
     ) -> list[dict]:
         """搜索全部页面，返回所有职位列表。
 
-        on_page(page_num, total_pages, items) 可选回调。
+        使用单次页面加载 + 点击翻页，避免每次翻页都重新导航浏览器。
+        80 页只需 1 次 page.goto 而非 80 次。
         """
         all_items: list[dict] = []
-        first_data = self.search_one_page(session, keyword, job_area, page_num=1)
-        if first_data is None:
+        captured_responses: list[dict] = []
+
+        def _setup_capture(page):
+            """注册 XHR 监听器，捕获搜索 API 的 JSON 响应。"""
+            def _on_response(response):
+                if "/api/job/search-pc" not in response.url or response.status != 200:
+                    return
+                try:
+                    body = response.body()
+                    if b"aliyun_waf" not in body:
+                        captured_responses.append(json.loads(body))
+                except Exception:
+                    pass
+            page.on("response", _on_response)
+
+        def _click_through_pages(page):
+            """等待首页 XHR 到达后，循环点击下一页按钮。"""
+            # 等待首页 XHR
+            for _ in range(20):
+                if captured_responses:
+                    break
+                page.wait_for_timeout(500)
+
+            if not captured_responses:
+                logger.warning("[%s][%s] 未捕获到 API 响应", keyword, job_area)
+                return
+
+            total_count = get_total_count(captured_responses[0])
+            pages = min(max_pages, (total_count + 19) // 20 if total_count else 1)
+            logger.info(
+                "[%s][%s] 总数=%d, 页数=%d",
+                keyword, job_area, total_count, pages,
+            )
+
+            for p in range(2, pages + 1):
+                prev_count = len(captured_responses)
+
+                # 点击"下一页"按钮，尝试多种可能的 CSS 选择器
+                clicked = False
+                for selector in [
+                    "li.page-next a",
+                    "a.page-next",
+                    'a[class*="next"]:not(.disabled)',
+                    ".page_wrap .page_next:not(.disable)",
+                    ".pagination li:last-child a",
+                    "li.page-item:last-child a.page-link",
+                    "button.btn-next:not(:disabled)",
+                    ".el-pagination button:last-child",
+                ]:
+                    try:
+                        el = page.locator(selector)
+                        if el.count() > 0 and el.first.is_enabled():
+                            el.first.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    logger.info(
+                        "[%s][%s] 下一页按钮不可点击，停止于第%d页",
+                        keyword, job_area, p - 1,
+                    )
+                    break
+
+                # 等待新的 XHR 到达
+                for _ in range(30):
+                    if len(captured_responses) > prev_count:
+                        break
+                    page.wait_for_timeout(500)
+
+                if len(captured_responses) <= prev_count:
+                    logger.warning("[%s][%s] 第%d页 XHR 未到达", keyword, job_area, p)
+                    break
+
+                if p % 10 == 0:
+                    logger.info(
+                        "[%s][%s] 翻页: %d/%d",
+                        keyword, job_area, p, pages,
+                    )
+
+                page.wait_for_timeout(300)
+
+        params = {
+            "keyword": keyword,
+            "searchType": "2",
+            "pageNum": "1",
+            "jobArea": job_area,
+        }
+        url = f"{BASE_SEARCH_URL}?{urlencode(params)}"
+
+        session.fetch(
+            url,
+            page_setup=_setup_capture,
+            page_action=_click_through_pages,
+            network_idle=True,
+            wait=200,
+        )
+
+        if not captured_responses:
             return all_items
 
-        total_count = get_total_count(first_data)
-        total_pages = min(
-            max_pages,
-            (total_count + 19) // 20 if total_count else max_pages,
-        )
-        logger.info(
-            "[%s][%s] 总数=%d, 页数=%d",
-            keyword, job_area, total_count, total_pages,
-        )
-
-        first_items = parse_api_response(first_data)
-        all_items.extend(first_items)
-        if on_page:
-            on_page(1, total_pages, first_items)
-
-        for page_num in range(2, total_pages + 1):
-            time.sleep(0.5)  # 页面间短暂间隔
-            data = self.search_one_page(session, keyword, job_area, page_num=page_num)
-            if data is None:
-                logger.warning("[%s][%s] 第%d页失败", keyword, job_area, page_num)
-                continue
-
+        for data in captured_responses:
             items = parse_api_response(data)
             all_items.extend(items)
-            if on_page:
-                on_page(page_num, total_pages, items)
 
-            if page_num % 10 == 0:
-                logger.info(
-                    "[%s][%s] 进度: %d/%d 页, 累计 %d 条",
-                    keyword, job_area, page_num, total_pages, len(all_items),
-                )
-
+        logger.info(
+            "[%s][%s] 完成: %d页, %d条",
+            keyword, job_area, len(captured_responses), len(all_items),
+        )
         return all_items
 
     def crawl_with_splitting(
