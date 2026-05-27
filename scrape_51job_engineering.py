@@ -1,19 +1,24 @@
 import argparse
 import html
 import json
+import random
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
 import pandas as pd
-from playwright.sync_api import sync_playwright
+from scrapling.fetchers import StealthySession
 
-TEMPLATE_PATH = Path("../数据模板.xlsx")
-OUTPUT_DIR = Path("../output")
+SCRIPT_DIR = Path(__file__).resolve().parent
+TEMPLATE_PATH = SCRIPT_DIR.parent / "数据模板.xlsx"
+OUTPUT_DIR = SCRIPT_DIR.parent / "output"
 BASE_SEARCH_URL = "https://we.51job.com/pc/search"
 DEFAULT_PLATFORM = "前程无忧"
 DEFAULT_CATEGORY = "工程/机械"
+DEFAULT_MAX_PAGES = 80
+DEFAULT_JOB_AREA = "000000"
 
 
 def build_search_url(keyword: str, page_num: int, job_area: str | None) -> str:
@@ -57,32 +62,34 @@ def read_template_columns() -> list[str]:
 
 
 def extract_list_items(page) -> list[dict]:
-    page.wait_for_selector(".joblist-item", timeout=30000)
     items = []
-    for item in page.query_selector_all(".joblist-item"):
-        title_el = item.query_selector(".jname")
-        salary_el = item.query_selector(".sal")
-        area_el = item.query_selector(".joblist-item-jobinfo .area")
-        company_el = item.query_selector(".cname")
-        comp_el = item.query_selector(".comp")
-        link_el = item.query_selector("a")
-        sensors_el = item.query_selector(".joblist-item-job")
+    for item in page.css(".joblist-item"):
+        title = item.css(".jname::text").get() or ""
+        salary = item.css(".sal::text").get() or ""
+        area_parts = item.css(".joblist-item-jobinfo .area *::text").getall()
+        area = "".join(area_parts).strip()
+        company = item.css(".cname::text").get() or ""
+        comp_info = "".join(item.css(".comp::text").getall()).strip()
+        job_link = item.css(".jname::attr(href)").get() or ""
+        if not job_link:
+            links = item.css("a::attr(href)").getall()
+            for link in links:
+                if re.search(r"https?://jobs\.51job\.com/[^/]+/\d+\.html", link):
+                    job_link = link
+                    break
+            if not job_link:
+                for link in links:
+                    if "jobs.51job.com" in link:
+                        job_link = link
+                        break
+            if not job_link and links:
+                job_link = links[0]
 
-        title = title_el.inner_text().strip() if title_el else ""
-        salary = salary_el.inner_text().strip() if salary_el else ""
-        area = area_el.inner_text().strip() if area_el else ""
-        company = company_el.inner_text().strip() if company_el else ""
-        comp_info = comp_el.inner_text().strip() if comp_el else ""
-        job_link = link_el.get_attribute("href") if link_el else ""
-
-        tags = [
-            t.inner_text().strip()
-            for t in item.query_selector_all(".joblist-item-tags .tag")
-        ]
+        tags = [t.strip() for t in item.css(".joblist-item-tags .tag::text").getall()]
 
         job_time = ""
-        if sensors_el:
-            sensors_raw = sensors_el.get_attribute("sensorsdata") or ""
+        sensors_raw = item.css(".joblist-item-job::attr(sensorsdata)").get() or ""
+        if sensors_raw:
             try:
                 sensors = json.loads(html.unescape(sensors_raw))
                 job_time = sensors.get("jobTime", "")
@@ -105,28 +112,17 @@ def extract_list_items(page) -> list[dict]:
 
 
 def extract_detail(page) -> dict:
-    page.wait_for_selector(".job-detail", timeout=30000)
-    location_el = page.query_selector(".msg.ltype .type_2")
-    experience_el = page.query_selector(".msg.ltype .type_3")
-    education_el = page.query_selector(".msg.ltype .type_4")
+    location = page.css(".msg.ltype .type_2::text").get() or ""
+    experience = page.css(".msg.ltype .type_3::text").get() or ""
+    education = page.css(".msg.ltype .type_4::text").get() or ""
 
-    location = location_el.inner_text().strip() if location_el else ""
-    experience = experience_el.inner_text().strip() if experience_el else ""
-    education = education_el.inner_text().strip() if education_el else ""
-
-    benefits = [
-        t.inner_text().strip()
-        for t in page.query_selector_all(".job-detail .tags .tag")
-    ]
-    desc_el = page.query_selector(".job_msg")
-    desc_text = desc_el.inner_text().strip() if desc_el else ""
+    benefits = [t.strip() for t in page.css(".job-detail .tags .tag::text").getall()]
+    desc_nodes = page.css(".job_msg")
+    desc_text = desc_nodes[0].get_all_text() if desc_nodes else ""
     job_content, requirements = split_job_desc(desc_text)
 
-    category_el = page.query_selector("p:has-text('职能类别') a")
-    category = category_el.inner_text().strip() if category_el else ""
-
-    address_el = page.query_selector(".job-address")
-    address = address_el.inner_text().strip() if address_el else ""
+    category = page.xpath("//p[contains(., '职能类别')]//a/text()").get() or ""
+    address = page.css(".job-address::text").get() or ""
 
     return {
         "location": location,
@@ -138,6 +134,15 @@ def extract_detail(page) -> dict:
         "category": category,
         "address": address,
     }
+
+
+def fetch_with_retry(session: StealthySession, url: str, retries: int = 3):
+    for attempt in range(1, retries + 1):
+        page = session.fetch(url)
+        if page and page.status == 200:
+            return page
+        time.sleep(2 + attempt)
+    return session.fetch(url)
 
 
 def build_row(idx: int, list_item: dict, detail_item: dict) -> dict:
@@ -174,34 +179,55 @@ def build_row(idx: int, list_item: dict, detail_item: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scrape 51job engineering data")
-    parser.add_argument("--pages", type=int, default=1, help="Number of pages to scrape")
+    parser.add_argument(
+        "--pages",
+        type=int,
+        default=0,
+        help="Number of pages to scrape; 0 means auto until empty",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=DEFAULT_MAX_PAGES,
+        help="Safety cap when --pages=0",
+    )
     parser.add_argument("--keyword", type=str, default=DEFAULT_CATEGORY)
-    parser.add_argument("--job-area", type=str, default="", help="Job area code, e.g. 030200")
+    parser.add_argument(
+        "--job-area",
+        type=str,
+        default=DEFAULT_JOB_AREA,
+        help="Job area code, e.g. 000000 for nationwide",
+    )
     args = parser.parse_args()
 
     columns = read_template_columns()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     rows = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        list_page = context.new_page()
-
-        for page_num in range(1, args.pages + 1):
+    with StealthySession(headless=True, solve_cloudflare=True) as session:
+        page_num = 1
+        max_pages = args.pages if args.pages > 0 else max(args.max_pages, 1)
+        while page_num <= max_pages:
             url = build_search_url(args.keyword, page_num, args.job_area or None)
-            list_page.goto(url, wait_until="networkidle")
+            list_page = fetch_with_retry(session, url)
             list_items = extract_list_items(list_page)
 
-            for list_item in list_items:
-                detail_page = context.new_page()
-                detail_page.goto(list_item["job_link"], wait_until="networkidle")
-                detail = extract_detail(detail_page)
-                detail_page.close()
+            if not list_items:
+                time.sleep(3)
+                list_page = fetch_with_retry(session, url)
+                list_items = extract_list_items(list_page)
+                if not list_items:
+                    break
 
+            for list_item in list_items:
+                if not list_item.get("job_link"):
+                    continue
+                time.sleep(random.uniform(1.2, 2.5))
+                detail_page = fetch_with_retry(session, list_item["job_link"])
+                detail = extract_detail(detail_page)
                 rows.append(build_row(len(rows) + 1, list_item, detail))
 
-        browser.close()
+            page_num += 1
 
     df = pd.DataFrame(rows, columns=columns)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
