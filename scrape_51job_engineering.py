@@ -11,7 +11,6 @@ import logging
 import multiprocessing as mp
 import re
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -32,8 +31,6 @@ from search_api import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = SCRIPT_DIR.parent / "数据模板.xlsx"
 OUTPUT_DIR = SCRIPT_DIR.parent / "output"
-PROGRESS_FILE = SCRIPT_DIR.parent / "crawl_progress.json"
-
 DEFAULT_PLATFORM = "前程无忧"
 DEFAULT_CATEGORY_L1 = "工程/机械"
 DEFAULT_MAX_PAGES = 80
@@ -391,6 +388,21 @@ def _crawl_worker(
     all_rows: list[dict] = []
     seen_ids: set[str] = set()
 
+    # 从中间输出恢复已爬数据（用于去重和 scout 判断）
+    output_path = _worker_output_file(worker_id)
+    if output_path.exists() and (ki > 0 or ai > 0):
+        try:
+            df = pd.read_excel(output_path)
+            for _, row in df.iterrows():
+                row_dict = row.to_dict()
+                jid = str(row_dict.get("岗位链接", ""))
+                if jid:
+                    seen_ids.add(jid)
+                all_rows.append(row_dict)
+            logger.info("从 %s 恢复了 %d 条数据", output_path.name, len(all_rows))
+        except Exception:
+            pass
+
     # 计算非 scout 省份 (full phase 用的 areas)
     scout_codes = {code for _, code in scout_areas}
     full_areas = [(n, c) for n, c in areas if c not in scout_codes]
@@ -418,27 +430,20 @@ def _crawl_worker(
                 keyword = keywords[ki]
 
                 if phase == "scout":
+                    rows_before = len(all_rows)
                     _run_phase(
                         worker_id, session, client, keyword,
                         scout_areas, ki, ai, max_pages,
                         all_rows, seen_ids, progress_path, "scout",
                     )
-                    # 判断 scout 是否通过: 检查此次 scout 是否有新增数据
-                    scout_before = len(all_rows)
-                    # scout 数据已经加进去了，检查本 keyword 是否有任何产出
-                    # 简单判断: 只要针对本 keyword 的 scout 轮次有新数据就算通过
-                    # 重新计算: 看本次 scout 覆盖的 area 中是否有结果
-                    # 实际做法: 看所有本 keyword 的搜索结果总数
-                    scout_passed = _check_scout_passed(
-                        session, client, keyword, scout_areas,
-                    )
+                    scout_passed = len(all_rows) > rows_before
                     if scout_passed:
-                        logger.info("[%s] scout 通过，进入全量阶段 (%d 省)",
-                                    keyword, len(full_areas))
+                        logger.info("[%s] scout 通过 (+%d 条)，进入全量阶段 (%d 省)",
+                                    keyword, len(all_rows) - rows_before, len(full_areas))
                         phase = "full"
                         ai = 0
                     else:
-                        logger.info("[%s] scout 未通过，跳过此关键词", keyword)
+                        logger.info("[%s] scout 无数据，跳过此关键词", keyword)
                         ki += 1
                         ai = 0
                         phase = "scout"
@@ -472,59 +477,6 @@ def _crawl_worker(
     _save_progress(progress_path, ki, ai, len(all_rows), phase)
     _save_worker_output(worker_id, all_rows)
     logger.info("完成: %d 条数据", len(all_rows))
-
-
-def _check_scout_passed(
-    session: StealthySession,
-    client: SearchAPIClient,
-    keyword: str,
-    scout_areas: list[tuple[str, str]],
-) -> bool:
-    """检查 scout 阶段是否有任何 area 返回了数据。
-
-    由于 search_all_pages 已运行过，数据已在 all_rows 中。
-    这里快速检查 keyword 在任意 scout area 的总 count。
-    """
-    # 快速验证: 取第一个 scout area 看是否返回了数据
-    # 实际上数据已在上一轮被收集，这里重新快速查询第一个 area 即可
-    # 如果第一个 area 返回 0，再检查其他 area
-    for area_name, area_code in scout_areas:
-        try:
-            # 只查第 1 页即可判断
-            import json as _json
-            from urllib.parse import urlencode as _urlencode
-            data = None
-            captured = []
-
-            def _setup(page):
-                def _on_response(response):
-                    if "/api/job/search-pc" in response.url and response.status == 200:
-                        try:
-                            body = response.body()
-                            if b"aliyun_waf" not in body:
-                                captured.append(_json.loads(body))
-                        except Exception:
-                            pass
-                page.on("response", _on_response)
-
-            def _action(page):
-                for _ in range(20):
-                    if captured:
-                        break
-                    page.wait_for_timeout(300)
-
-            params = {"keyword": keyword, "searchType": "2", "pageNum": "1",
-                       "jobArea": area_code}
-            url = f"https://we.51job.com/pc/search?{_urlencode(params)}"
-            session.fetch(url, page_setup=_setup, page_action=_action,
-                          network_idle=True, wait=200)
-            if captured:
-                total = captured[0].get("resultbody", {}).get("job", {}).get("totalCount", 0)
-                if total > 0:
-                    return True
-        except Exception:
-            continue
-    return False
 
 
 def _run_phase(
