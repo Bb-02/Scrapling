@@ -1,40 +1,116 @@
+"""
+51job "工程/机械" 类别全国职位爬虫。
+
+策略: 浏览器 + XHR 拦截获取搜索 API JSON，子标签 × 地域多维度拆分，
+最大限度突破 51job 单次搜索 1,600 条限制。
+"""
+
 import argparse
-import html
 import json
 import logging
-import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
 
 import pandas as pd
-import requests
 from scrapling.fetchers import StealthySession
-from scrapling.parser import Selector
+
+from search_api import (
+    SearchAPIClient,
+    PROVINCE_CODES,
+    MAJOR_CITY_CODES,
+    parse_api_response,
+)
 
 # ============================================================
-# 配置常量
+# 配置
 # ============================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = SCRIPT_DIR.parent / "数据模板.xlsx"
 OUTPUT_DIR = SCRIPT_DIR.parent / "output"
 PROGRESS_FILE = SCRIPT_DIR.parent / "crawl_progress.json"
-BASE_SEARCH_URL = "https://we.51job.com/pc/search"
 
 DEFAULT_PLATFORM = "前程无忧"
-DEFAULT_CATEGORY = "工程/机械"
-DEFAULT_JOB_AREA = "000000"
+DEFAULT_CATEGORY_L1 = "工程/机械"
+DEFAULT_JOB_AREA = "000000"  # 全国，但会被 IP 覆盖，实际用地域拆分
 DEFAULT_MAX_PAGES = 80
-MAX_RETRIES = 3
-RETRY_BASE_WAIT = 2
-LIST_PAGE_WAIT = (2, 4)          # 列表页之间（浏览器）
-DETAIL_DELAY = (0.3, 0.5)        # 详情页之间（HTTP，可大幅缩短）
-EMPTY_PAGE_RETRY_WAIT = 3
-DETAIL_CONCURRENCY = 8           # 并发抓取详情页的线程数
+
+# 工程/机械 下的子标签（从 51job 左侧筛选栏获取）
+SUB_CATEGORIES = [
+    "机械工程师",
+    "机电工程师",
+    "结构工程师",
+    "模具工程师",
+    "设备工程师",
+    "机械设计",
+    "机械绘图员",
+    "机械维修",
+    "机械工艺",
+    "机械制图",
+    "机械自动化",
+    "电气工程师",
+    "自动化工程师",
+    "工业工程师",
+    "材料工程师",
+    "焊接工程师",
+    "铸造工程师",
+    "锻造工程师",
+    "冲压工程师",
+    "注塑工程师",
+    "CNC工程师",
+    "数控编程",
+    "质量管理",
+    "质量工程师",
+    "机械质检",
+    "工程监理",
+    "工程项目管理",
+    "土木工程",
+    "建筑工程",
+    "暖通工程师",
+    "给排水工程师",
+    "水利工程",
+    "岩土工程",
+    "测绘工程师",
+    "安全工程师",
+    "焊接",
+    "钣金",
+    "车工",
+    "磨工",
+    "铣工",
+    "钳工",
+    "电焊工",
+    "装配工",
+    "维修工",
+    "电工",
+    "技工",
+    "操作工",
+    "生产技术",
+    "工艺工程师",
+    "PE工程师",
+    "IE工程师",
+    "NPI工程师",
+    "ME工程师",
+    "测试工程师",
+    "可靠性工程师",
+    "实验室技术员",
+    "工程经理",
+    "项目工程师",
+    "研发工程师",
+    "产品工程师",
+    "制冷工程师",
+    "热能工程师",
+    "液压工程师",
+    "气动工程师",
+    "船舶工程师",
+    "汽车工程师",
+    "医疗器械工程师",
+    "仪器仪表工程师",
+    "机器人工程师",
+    "无人机工程师",
+]
+
 
 # ============================================================
 # 日志
@@ -47,8 +123,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ============================================================
-# 城市 -> 省份 映射
+# 城市/省份 映射
 # ============================================================
 
 CITY_PROVINCE: dict[str, str] = {
@@ -90,9 +167,9 @@ CITY_PROVINCE: dict[str, str] = {
     "新余": "江西省", "鹰潭": "江西省", "赣州": "江西省", "吉安": "江西省",
     "宜春": "江西省", "抚州": "江西省", "上饶": "江西省",
     "济南": "山东省", "青岛": "山东省", "淄博": "山东省", "枣庄": "山东省",
-    "东营": "山东省", "烟台": "山东省", "潍坊": "山东省", "济宁": "山东省",
-    "泰安": "山东省", "威海": "山东省", "日照": "山东省", "临沂": "山东省",
-    "德州": "山东省", "聊城": "山东省", "滨州": "山东省", "菏泽": "山东省",
+    "东营": "山东省", "烟台": "山东省", "威海": "山东省", "日照": "山东省",
+    "临沂": "山东省", "德州": "山东省", "聊城": "山东省", "滨州": "山东省",
+    "菏泽": "山东省", "潍坊": "山东省", "济宁": "山东省", "泰安": "山东省",
     "郑州": "河南省", "开封": "河南省", "洛阳": "河南省", "平顶山": "河南省",
     "安阳": "河南省", "鹤壁": "河南省", "新乡": "河南省", "焦作": "河南省",
     "濮阳": "河南省", "许昌": "河南省", "漯河": "河南省", "三门峡": "河南省",
@@ -142,110 +219,41 @@ CITY_PROVINCE: dict[str, str] = {
 }
 
 
-def infer_province(city: str, address: str = "") -> str:
+def infer_province(city: str) -> str:
     if not city:
         return ""
     if city in CITY_PROVINCE:
         return CITY_PROVINCE[city]
-    if address:
-        m = re.match(
-            r"^(北京市|上海市|天津市|重庆市|[^省]+省|[^区]+自治区|香港特别行政区|澳门特别行政区)",
-            address,
-        )
-        if m:
-            return m.group(1)
     return ""
 
 
-# ============================================================
-# 断点续爬
-# ============================================================
-
-
-def load_progress() -> dict:
-    if not PROGRESS_FILE.exists():
-        return {"keyword_index": 0, "page": 1}
-
-    try:
-        progress = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        logger.warning("断点文件读取失败，将从头开始爬取：%s", PROGRESS_FILE)
-        return {"keyword_index": 0, "page": 1}
-
-    keyword_index = progress.get("keyword_index", 0)
-    page = progress.get("page", 1)
-    if not isinstance(keyword_index, int) or keyword_index < 0:
-        keyword_index = 0
-    if not isinstance(page, int) or page < 1:
-        page = 1
-    return {"keyword_index": keyword_index, "page": page}
-
-
-def save_progress(keyword_index: int, page: int) -> None:
-    PROGRESS_FILE.write_text(
-        json.dumps({"keyword_index": keyword_index, "page": page}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-# ============================================================
-# 工具函数
-# ============================================================
-
-
-def build_search_url(keyword: str, page_num: int, job_area: str | None) -> str:
-    params = {"keyword": keyword, "searchType": "2", "pageNum": str(page_num)}
-    if job_area:
-        params["jobArea"] = job_area
-    return f"{BASE_SEARCH_URL}?{urlencode(params)}"
-
-
-def parse_company_size(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r"(\d+[-~]\d+人|\d+人以上|少于\d+人|\d+人)", text)
-    return m.group(1) if m else ""
-
-
-def split_location(area_text: str) -> tuple[str, str]:
-    if not area_text:
+def parse_location(job_area_string: str) -> tuple[str, str]:
+    """从 jobAreaString 拆分城市和省。格式如 '广州·天河区' 或 '深圳'。"""
+    if not job_area_string:
         return "", ""
-    city = re.split(r"[-·]", area_text)[0].strip()
+    parts = re.split(r"[·\-]", job_area_string)
+    city = parts[0].strip() if parts else ""
     province = infer_province(city)
+    # 直辖市处理
+    if city in ("北京", "上海", "天津", "重庆"):
+        province = city + "市"
     return province, city
 
 
-def clean_description(text: str) -> str:
-    if not text:
-        return ""
-    text = html.unescape(str(text))
-    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
-    text = re.sub(r"(?i)</?\s*(div|p|li|section|tr|h[1-6])\s*>", "\n", text)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = text.replace("\r", "\n").replace("　", " ").replace("\xa0", " ")
-
-    lines: list[str] = []
-    for line in text.splitlines():
-        line = re.sub(r"[ \t]+", " ", line).strip()
-        if not line:
-            continue
-        if line not in lines[-2:]:
-            lines.append(line)
-    return "\n".join(lines)
-
-
-def split_job_desc(desc_text: str) -> tuple[str, str]:
-    text = clean_description(desc_text)
-    if not text:
+def parse_job_description(job_describe: str) -> tuple[str, str]:
+    """拆分职位描述为工作内容和任职要求。"""
+    if not job_describe:
         return "", ""
 
+    text = str(job_describe)
+    # 常见分隔模式
     requirement_pattern = re.compile(
         r"(任职要求|任职资格|职位要求|岗位要求|应聘要求|资格要求|任职条件)[:：】\]\s]*"
     )
     m = requirement_pattern.search(text)
     if not m:
         return text, ""
-    work_content = text[: m.start()].strip()
+    work_content = text[:m.start()].strip()
     requirements = (m.group() + text[m.end():]).strip()
     return work_content, requirements
 
@@ -263,332 +271,235 @@ def read_template_columns() -> list[str]:
     ]
 
 
-# ============================================================
-# 页面解析（列表页用 Scrapling Page，详情页用 Selector）
-# ============================================================
+def build_row(idx: int, item: dict) -> dict:
+    """将 API 数据转为模板 Excel 行。"""
+    province, city = parse_location(item.get("jobAreaString", ""))
+    work_content, requirements = parse_job_description(item.get("jobDescribe", ""))
 
+    # 福利标签
+    welfare = item.get("welfareList", [])
+    if isinstance(welfare, list) and welfare:
+        if isinstance(welfare[0], dict):
+            welfare_str = " / ".join(
+                w.get("chineseTitle", "") or w.get("typeTitle", "")
+                for w in welfare
+            )
+        else:
+            welfare_str = " / ".join(str(w) for w in welfare)
+    else:
+        welfare_str = ""
 
-def extract_list_items(page) -> list[dict]:
-    """从 Scrapling 的浏览器页面提取列表项。"""
-    items: list[dict] = []
-    for item in page.css(".joblist-item"):
-        title = item.css(".jname::text").get() or ""
-        salary = item.css(".sal::text").get() or ""
-        area_parts = item.css(".joblist-item-jobinfo .area *::text").getall()
-        area = "".join(area_parts).strip()
-        company = item.css(".cname::text").get() or ""
-        comp_info = "".join(item.css(".comp::text").getall()).strip()
-        job_link = item.css(".jname::attr(href)").get() or ""
-        if not job_link:
-            links = item.css("a::attr(href)").getall()
-            for link in links:
-                if re.search(r"https?://jobs\.51job\.com/[^/]+/\d+\.html", link):
-                    job_link = link
-                    break
-            if not job_link:
-                for link in links:
-                    if "jobs.51job.com" in link:
-                        job_link = link
-                        break
-            if not job_link and links:
-                job_link = links[0]
+    # 子标签
+    tags = item.get("jobTags", [])
+    if isinstance(tags, list):
+        tags_str = " / ".join(
+            t.get("jobTagName", "") if isinstance(t, dict) else str(t)
+            for t in tags
+        )
+    else:
+        tags_str = str(tags) if tags else ""
 
-        tags = [t.strip() for t in item.css(".joblist-item-tags .tag::text").getall()]
-
-        job_time = ""
-        sensors_raw = item.css(".joblist-item-job::attr(sensorsdata)").get() or ""
-        if sensors_raw:
-            try:
-                sensors = json.loads(html.unescape(sensors_raw))
-                job_time = sensors.get("jobTime", "")
-            except json.JSONDecodeError:
-                job_time = ""
-
-        items.append({
-            "title": title,
-            "salary": salary,
-            "area": area,
-            "company": company,
-            "company_info": comp_info,
-            "job_link": job_link,
-            "job_time": job_time,
-            "tags": tags,
-        })
-    return items
-
-
-def extract_detail_from_html(html_text: str) -> dict:
-    """从 HTML 字符串解析详情页（不需要浏览器）。"""
-    sel = Selector(html_text)
-
-    location = (sel.css(".msg.ltype .type_2::text").get() or "").strip()
-    experience = (sel.css(".msg.ltype .type_3::text").get() or "").strip()
-    education = (sel.css(".msg.ltype .type_4::text").get() or "").strip()
-
-    benefits = [t.strip() for t in sel.css(".job-detail .tags .tag::text").getall()]
-    desc_nodes = sel.css(".job_msg")
-    desc_text = desc_nodes[0].get_all_text() if desc_nodes else ""
-    job_content, requirements = split_job_desc(desc_text)
-
-    category = (sel.xpath("//p[contains(., '职能类别')]//a/text()").get() or "").strip()
-    address = (sel.css(".job-address::text").get() or "").strip()
-
-    return {
-        "location": location,
-        "experience": experience,
-        "education": education,
-        "benefits": benefits,
-        "job_content": job_content,
-        "requirements": requirements,
-        "category": category,
-        "address": address,
-    }
-
-
-def build_row(idx: int, list_item: dict, detail_item: dict) -> dict:
-    area_text = detail_item.get("location") or list_item.get("area", "")
-    province, city = split_location(area_text)
-    company_size = parse_company_size(list_item.get("company_info", ""))
+    # 岗位类型二级
+    func_types = []
+    for k in ("industryType1", "industryType2"):
+        v = item.get(k, "")
+        if v and v not in func_types:
+            func_types.append(v)
+    func_type_str = " / ".join(func_types)
 
     return {
         "序号": idx,
         "招聘平台": DEFAULT_PLATFORM,
-        "岗位类型\n一级": DEFAULT_CATEGORY,
-        "岗位类型\n二级": detail_item.get("category", ""),
-        "岗位名称": list_item.get("title", ""),
+        "岗位类型\n一级": DEFAULT_CATEGORY_L1,
+        "岗位类型\n二级": func_type_str or "/",
+        "岗位名称": item.get("jobName", ""),
         "岗位类型\n企业/公务员/事业单位/军队文职": "企业",
-        "公司名称": list_item.get("company", ""),
-        "公司规模": company_size,
+        "公司名称": item.get("fullCompanyName", "") or item.get("companyName", ""),
+        "公司规模": item.get("companySize", "/"),
         "所在省份": province,
         "城市": city,
-        "详细地址": detail_item.get("address", ""),
-        "学历要求": detail_item.get("education", ""),
-        "经验要求": detail_item.get("experience", ""),
-        "薪资范围": list_item.get("salary", ""),
-        "福利标签": " / ".join(detail_item.get("benefits", [])),
-        "工作内容": detail_item.get("job_content", ""),
-        "任职要求": detail_item.get("requirements", ""),
-        "岗位链接": list_item.get("job_link", ""),
-        "发布时间": list_item.get("job_time", ""),
-        "投递起始时间": "",
-        "投递截止时间": "",
-        "证书要求": "",
-        "备注（技能要求）": " / ".join(list_item.get("tags", [])),
+        "详细地址": item.get("jobAreaString", "/"),
+        "学历要求": item.get("degree", "/"),
+        "经验要求": item.get("workYear", "/"),
+        "薪资范围": item.get("salary", "/"),
+        "福利标签": welfare_str or "/",
+        "工作内容": work_content or "/",
+        "任职要求": requirements or "/",
+        "岗位链接": item.get("jobHref", ""),
+        "发布时间": item.get("issueDate", "") or item.get("updateDate", ""),
+        "投递起始时间": "/",
+        "投递截止时间": "/",
+        "证书要求": "/",
+        "备注（技能要求）": tags_str or "/",
     }
 
 
 # ============================================================
-# 详情页并发抓取（核心优化点）
+# 断点续爬
 # ============================================================
 
-
-def _fetch_one_detail(
-    http_session: requests.Session,
-    list_item: dict,
-    detail_headers: dict,
-) -> dict | None:
-    """抓取并解析单个详情页（在线程池中运行）。"""
-    url = list_item.get("job_link", "")
-    if not url:
-        return None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = http_session.get(url, headers=detail_headers, timeout=15)
-            if resp.status_code == 200:
-                detail = extract_detail_from_html(resp.text)
-                return detail
-            wait = RETRY_BASE_WAIT * (2 ** (attempt - 1))
-            time.sleep(wait)
-        except Exception:
-            if attempt < MAX_RETRIES:
-                wait = RETRY_BASE_WAIT * (2 ** (attempt - 1))
-                time.sleep(wait)
-            else:
-                logger.error("详情页请求失败(%d次): %s", MAX_RETRIES, url)
-    return None
-
-
-def fetch_details_concurrently(
-    http_session: requests.Session,
-    list_items: list[dict],
-    detail_headers: dict,
-    concurrency: int = DETAIL_CONCURRENCY,
-) -> list[dict]:
-    """并发抓取所有详情页，保持原始顺序返回。"""
-    results: list[dict | None] = [None] * len(list_items)
-
-    # 先过滤出有链接的项
-    valid_indices = [
-        i for i, item in enumerate(list_items) if item.get("job_link")
-    ]
-    if not valid_indices:
-        return []
-
-    logger.info("  并发抓取%d个详情页（并发数=%d）...", len(valid_indices), concurrency)
-
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        future_to_index = {
-            pool.submit(
-                _fetch_one_detail, http_session, list_items[i], detail_headers
-            ): i
-            for i in valid_indices
-        }
-        done = 0
-        for future in as_completed(future_to_index):
-            idx = future_to_index[future]
-            try:
-                results[idx] = future.result()
-            except Exception as exc:
-                logger.error("详情页解析异常 [%s]: %s", list_items[idx].get("title", ""), exc)
-            done += 1
-            if done % 20 == 0 or done == len(valid_indices):
-                logger.info("  详情页进度: %d/%d", done, len(valid_indices))
-
-    return results
-
-
-# ============================================================
-# 网络请求（列表页用浏览器）
-# ============================================================
-
-
-def fetch_list_page(
-    session: StealthySession,
-    url: str,
-    label: str = "",
-) -> "Page | object":
-    """获取列表页，指数退避重试。"""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            page = session.fetch(url)
-            if page is not None and page.status == 200:
-                return page
-            wait = RETRY_BASE_WAIT * (2 ** (attempt - 1))
-            logger.warning(
-                "%s第%d次请求失败(status=%s)，%d秒后重试",
-                label, attempt, getattr(page, "status", "None"), wait,
-            )
-            time.sleep(wait)
-        except Exception as exc:
-            if attempt >= MAX_RETRIES:
-                raise
-            wait = RETRY_BASE_WAIT * (2 ** (attempt - 1))
-            logger.warning("%s第%d次请求异常，%d秒后重试：%s", label, attempt, wait, exc)
-            time.sleep(wait)
-    return session.fetch(url)
-
-
-def build_http_session_from_browser(session: StealthySession) -> requests.Session:
-    """从 StealthySession 的浏览器中提取 cookies 并构建 requests.Session。"""
-    http_session = requests.Session()
+def load_progress() -> dict:
+    if not PROGRESS_FILE.exists():
+        return {"keyword_idx": 0, "area_idx": 0, "total": 0}
     try:
-        # 通过 Playwright 获取所有 cookies
-        cookies = session.page.context.cookies()
-        cookie_dict = {c["name"]: c["value"] for c in cookies}
-        http_session.cookies.update(cookie_dict)
-        logger.info("  已从浏览器同步 %d 个 cookies", len(cookies))
-    except Exception:
-        logger.warning("  无法获取浏览器 cookies，将不带 cookies 请求详情页")
-    return http_session
+        return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {"keyword_idx": 0, "area_idx": 0, "total": 0}
+
+
+def save_progress(keyword_idx: int, area_idx: int, total: int) -> None:
+    PROGRESS_FILE.write_text(
+        json.dumps(
+            {"keyword_idx": keyword_idx, "area_idx": area_idx, "total": total},
+            ensure_ascii=False, indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 # ============================================================
 # 主流程
 # ============================================================
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Scrape 51job engineering data")
-    parser.add_argument("--pages", type=int, default=0)
+def main():
+    parser = argparse.ArgumentParser(description="51job 工程/机械 全国爬虫")
+    parser.add_argument("--keywords", type=str, nargs="*", default=None,
+                        help="指定子标签，默认使用内置列表")
+    parser.add_argument("--areas", type=str, default="provinces",
+                        choices=["provinces", "cities", "both"],
+                        help="地域拆分级别: provinces=省级(默认), cities=城市级, both=两者")
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
-    parser.add_argument("--keyword", type=str, default=DEFAULT_CATEGORY)
-    parser.add_argument("--job-area", type=str, default=DEFAULT_JOB_AREA)
-    parser.add_argument("--concurrency", type=int, default=DETAIL_CONCURRENCY,
-                        help="详情页并发线程数")
+    parser.add_argument("--resume", action="store_true", default=False,
+                        help="从断点继续")
+    parser.add_argument("--limit-keywords", type=int, default=0,
+                        help="限制子标签数量（测试用）")
+    parser.add_argument("--limit-areas", type=int, default=0,
+                        help="限制地域数量（测试用）")
     args = parser.parse_args()
 
-    progress = load_progress()
-    start_page = progress["page"]
-    if start_page > 1:
-        logger.info("从断点继续：第%d页", start_page)
+    # 准备搜索列表
+    keywords = args.keywords if args.keywords else SUB_CATEGORIES
+    if args.limit_keywords > 0:
+        keywords = keywords[:args.limit_keywords]
 
-    columns = read_template_columns()
+    if args.areas == "provinces":
+        areas = list(PROVINCE_CODES.items())
+    elif args.areas == "cities":
+        areas = list(MAJOR_CITY_CODES.items())
+    else:
+        areas = list(PROVINCE_CODES.items()) + list(MAJOR_CITY_CODES.items())
+
+    if args.limit_areas > 0:
+        areas = areas[:args.limit_areas]
+
+    # 断点续爬
+    progress = load_progress()
+    start_ki = progress.get("keyword_idx", 0) if args.resume else 0
+    start_ai = progress.get("area_idx", 0) if args.resume else 0
+    all_rows: list[dict] = progress.get("rows", []) if args.resume else []
+
+    logger.info(
+        "配置: %d 子标签 × %d 地域, 最多 %d 页/搜索",
+        len(keywords), len(areas), args.max_pages,
+    )
+    if args.resume and start_ki > 0:
+        logger.info("从断点恢复: keyword_idx=%d, area_idx=%d, 已累计 %d 条",
+                     start_ki, start_ai, len(all_rows))
+
+    # 爬取
+    client = SearchAPIClient(headless=True, timeout=60000)
+    seen_job_ids: set[str] = {row.get("岗位链接", "") for row in all_rows if row.get("岗位链接")}
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    all_rows: list[dict] = []
-    detail_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://we.51job.com/",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    }
+    ki = start_ki
+    ai = start_ai
+    try:
+        with StealthySession(
+            headless=True,
+            solve_cloudflare=True,
+            real_chrome=True,
+            network_idle=True,
+            wait=3000,
+            timeout=60000,
+            capture_xhr=r"https://we\.51job\.com/api/job/search-pc.*",
+            google_search=False,
+            hide_canvas=True,
+            block_webrtc=True,
+        ) as session:
+            for ki in range(start_ki, len(keywords)):
+                keyword = keywords[ki]
+                ai_start = start_ai if ki == start_ki else 0
 
-    with StealthySession(headless=True, solve_cloudflare=True) as browser_session:
-        # 先访问一次搜索页，让浏览器拿到 cookies
-        init_url = build_search_url(args.keyword, 1, args.job_area or None)
-        fetch_list_page(browser_session, init_url, label="[初始化] ")
-        http_session = build_http_session_from_browser(browser_session)
+                for ai in range(ai_start, len(areas)):
+                    area_name, area_code = areas[ai]
+                    logger.info("=== [%d/%d] %s @ %s(%s) ===",
+                                ki + 1, len(keywords), keyword, area_name, area_code)
 
-        page_num = start_page
-        max_pages = args.pages if args.pages > 0 else max(args.max_pages, 1)
+                    items = client.search_all_pages(
+                        session, keyword, area_code,
+                        max_pages=args.max_pages,
+                    )
 
-        while page_num <= max_pages:
-            label = f"[{args.keyword}][第{page_num}页]"
+                    new_count = 0
+                    for item in items:
+                        jid = item.get("jobHref", "") or item.get("jobId", "")
+                        if jid and jid not in seen_job_ids:
+                            seen_job_ids.add(jid)
+                            all_rows.append(build_row(len(all_rows) + 1, item))
+                            new_count += 1
 
-            # --- 列表页（用浏览器） ---
-            if page_num > start_page or all_rows:
-                wait = random.uniform(*LIST_PAGE_WAIT)
-                logger.info("%s 等待%.1f秒...", label, wait)
-                time.sleep(wait)
+                    logger.info(
+                        "-> %s@%s: 新增 %d, 累计 %d 条",
+                        keyword, area_name, new_count, len(all_rows),
+                    )
 
-            url = build_search_url(args.keyword, page_num, args.job_area or None)
-            logger.info("%s 开始获取列表页", label)
-            list_page = fetch_list_page(browser_session, url, label=f"{label} ")
-            list_items = extract_list_items(list_page)
+                    save_progress(ki, ai + 1, len(all_rows))
 
-            if not list_items:
-                logger.warning("%s 列表为空，%d秒后重试", label, EMPTY_PAGE_RETRY_WAIT)
-                time.sleep(EMPTY_PAGE_RETRY_WAIT)
-                list_page = fetch_list_page(browser_session, url, label=f"{label} ")
-                list_items = extract_list_items(list_page)
-                if not list_items:
-                    logger.info("%s 确认无数据，停止翻页", label)
-                    break
+                    # 定期保存中间结果
+                    if len(all_rows) % 500 == 0 and all_rows:
+                        _save_intermediate(all_rows)
 
-            logger.info("%s 获取%d条列表项", label, len(list_items))
+    except KeyboardInterrupt:
+        logger.info("用户中断，保存当前进度...")
+        save_progress(ki, ai, len(all_rows))
+        _save_intermediate(all_rows)
+        logger.info("进度已保存，共 %d 条", len(all_rows))
+        return
+    except Exception:
+        logger.exception("爬取异常，保存进度...")
+        save_progress(ki, ai, len(all_rows))
+        _save_intermediate(all_rows)
+        raise
 
-            # --- 详情页（用 HTTP 并发抓取） ---
-            detail_results = fetch_details_concurrently(
-                http_session,
-                list_items,
-                detail_headers,
-                concurrency=args.concurrency,
-            )
-
-            # --- 组装数据 ---
-            for i, list_item in enumerate(list_items):
-                row_idx = len(all_rows) + 1
-                detail = detail_results[i] if i < len(detail_results) and detail_results[i] else {}
-                all_rows.append(build_row(row_idx, list_item, detail))
-
-            save_progress(0, page_num + 1)
-            page_num += 1
-
-            logger.info("%s 完成，累计%d条", label, len(all_rows))
-
+    # 最终保存
     if not all_rows:
         logger.warning("未获取到任何数据")
         return
 
+    _save_final(all_rows)
+    PROGRESS_FILE.unlink(missing_ok=True)
+    logger.info("全部完成!")
+
+
+def _save_intermediate(rows: list[dict]) -> None:
+    """保存中间结果。"""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = OUTPUT_DIR / f"51job_engineering_{stamp}.xlsx"
-    df = pd.DataFrame(all_rows, columns=columns)
-    df.to_excel(output_path, index=False, sheet_name="Sheet1")
-    logger.info("保存完成：%s（共%d条）", output_path, len(all_rows))
+    path = OUTPUT_DIR / f"51job_engineering_partial_{stamp}.xlsx"
+    columns = read_template_columns()
+    df = pd.DataFrame(rows, columns=columns)
+    df.to_excel(path, index=False, sheet_name="Sheet1")
+    logger.info("中间结果已保存: %s (%d 条)", path, len(rows))
+
+
+def _save_final(rows: list[dict]) -> None:
+    """保存最终结果。"""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = OUTPUT_DIR / f"51job_engineering_{stamp}.xlsx"
+    columns = read_template_columns()
+    df = pd.DataFrame(rows, columns=columns)
+    df.to_excel(path, index=False, sheet_name="Sheet1")
+    logger.info("最终结果: %s (%d 条)", path, len(rows))
 
 
 if __name__ == "__main__":
