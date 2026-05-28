@@ -1,0 +1,14 @@
+2026/05/28-11:35:18.981 5e7c Reusing MANIFEST D:\ShiRongBaiGong_Data\Scrapling\Scrapling\chrome_profile\Default\IndexedDB\https_we.51job.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/05/28-11:35:18.981 5e7c Recovering log #10
+2026/05/28-11:35:18.982 5e7c Reusing old log D:\ShiRongBaiGong_Data\Scrapling\Scrapling\chrome_profile\Default\IndexedDB\https_we.51job.com_0.indexeddb.leveldb/000010.log 
+2026/05/28-11:35:18.982 5e7c Delete type=2 #8
+2026/05/28-11:35:18.986 5e7c Level-0 table #15: started
+2026/05/28-11:35:18.988 5e7c Level-0 table #15: 1086 bytes OK
+2026/05/28-11:35:18.989 5e7c Delete type=0 #10
+2026/05/28-11:35:18.989 5e7c Manual compaction at level-0 from '\x00\x04\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x05\x00\x00\x00' @ 0 : 0; will stop at '\x00\x04\x00\x00\xc8\x04\x00d\x00a\x00t\x00a' @ 212 : 1
+2026/05/28-11:35:18.989 5e7c Compacting 1@0 + 1@1 files
+2026/05/28-11:35:18.990 5e7c Generated table #16@0: 21 keys, 637 bytes
+2026/05/28-11:35:18.990 5e7c Compacted 1@0 + 1@1 files => 637 bytes
+2026/05/28-11:35:18.991 5e7c compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/05/28-11:35:18.991 5e7c Delete type=2 #15
+2026/05/28-11:35:18.991 5e7c Manual compaction at level-0 from '\x00\x04\x00\x00\xc8\x04\x00d\x00a\x00t\x00a' @ 212 : 1 .. '\x00\x05\x00\x00\x00' @ 0 : 0; will stop at (end)

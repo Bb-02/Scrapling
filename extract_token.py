@@ -297,11 +297,14 @@ async def test_cupid_api():
     print(f"user-token: {user_token}")
     print(f"timestamp: {ts}")
 
+    # 测试1+2 已确认：we.51job.com 被阿里云 WAF 的 TLS 指纹检测拦截，
+    # 无论是否带 HMAC/cookie 都无法绕过。跳过，直接测 cupid。
+
     # 通用请求头（模拟浏览器）
     common_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
         "user-token": user_token,
-        "Referer": "https://we.51job.com/pc/search?keyword=机械工程师&jobArea=000000",
+        "Referer": "https://we.51job.com/pc/search?keyword=%E6%9C%BA%E6%A2%B0%E5%B7%A5%E7%A8%8B%E5%B8%88&jobArea=000000",
         "Cookie": cookie_str,
     }
 
@@ -350,8 +353,8 @@ async def test_cupid_api():
     except Exception as e:
         print(f"失败: {e}")
 
-    # 测试3B: cupid 搜索端点 — 完全模拟浏览器，但不加 HMAC
-    print("\n--- 测试3B: cupid.51job.com 搜索端点（模拟浏览器，无签名） ---")
+    # 测试3B: cupid 搜索端点 — 加 HMAC 签名
+    print("\n--- 测试3B: cupid.51job.com 搜索端点（带 HMAC 签名） ---")
     cupid_urls = [
         "https://cupid.51job.com/open/noauth/job/search-pc",
         "https://cupid.51job.com/api/job/search-pc",
@@ -359,12 +362,29 @@ async def test_cupid_api():
     for url in cupid_urls:
         print(f"\n尝试: {url}")
         params = {"api_key": "51job", "timestamp": ts, "keyword": "机械工程师",
-                   "jobArea": "000000", "pageNum": "1", "pageSize": "20"}
+                   "jobArea": "000000", "searchType": "2", "sortType": "0",
+                   "pageNum": "1", "pageSize": "20"}
         try:
             qs = urlencode(params)
-            resp = requests.get(f"{url}?{qs}", headers=common_headers, timeout=15)
+            path = urllib.parse.urlparse(url).path
+            sig = _build_hmac_signature(f"{path}?{qs}")
+            full_url = f"{url}?{qs}&signature={sig}"
+            print(f"path用于签名: {path}?{qs}")
+            print(f"签名: {sig[:40]}...")
+            resp = requests.get(full_url, headers=common_headers, timeout=15)
             ct = resp.headers.get("Content-Type", "")
-            print(f"HTTP {resp.status_code} ({ct}): {resp.text[:400]}")
+            print(f"HTTP {resp.status_code} ({ct})")
+            print(f"原始响应: {resp.text[:600]}")
+            if "application/json" in ct:
+                try:
+                    data = resp.json()
+                    if data.get("resultbody") and isinstance(data["resultbody"], dict):
+                        items = data["resultbody"].get("job", {}).get("items", [])
+                        if items:
+                            print(f"✓ 成功！{len(items)} 条职位")
+                            break
+                except Exception:
+                    pass
         except Exception as e:
             print(f"失败: {e}")
 
