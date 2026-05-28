@@ -284,94 +284,89 @@ async def test_cupid_api():
     except Exception as e:
         print(f"请求失败: {e}")
 
-    # 测试3: cupid API — 不用 HMAC 签名（浏览器里的 cupid 请求都没有 signature）
+    # 测试3: 完全模拟浏览器的请求 — 10位秒级时间戳 + user-token header + Referer
     print("\n" + "=" * 60)
-    print("测试3: cupid.51job.com（不用 HMAC 签名）")
+    print("测试3: 完全模拟浏览器请求头")
     print("=" * 60)
 
     import urllib.parse
     from urllib.parse import urlencode
 
-    ts = str(int(time.time() * 1000))
+    ts = str(int(time.time()))  # 10位秒级时间戳，和浏览器一致
     user_token = token_data.get("localStorage", {}).get("token", "")
+    print(f"user-token: {user_token}")
+    print(f"timestamp: {ts}")
 
-    # 尝试多种 cupid 搜索路径和鉴权方式
-    cupid_tests = [
-        # 方式A: 只用 cookie
-        {
-            "url": "https://cupid.51job.com/open/noauth/job/search-pc",
-            "params": {"api_key": "51job", "keyword": "机械工程师", "jobArea": "000000",
-                       "pageNum": "1", "pageSize": "20", "timestamp": ts},
-            "headers": {"Cookie": cookie_str},
-        },
-        # 方式B: cookie + user-token header
-        {
-            "url": "https://cupid.51job.com/open/noauth/job/search-pc",
-            "params": {"api_key": "51job", "keyword": "机械工程师", "jobArea": "000000",
-                       "pageNum": "1", "pageSize": "20", "timestamp": ts},
-            "headers": {"Cookie": cookie_str, "user-token": user_token} if user_token else None,
-        },
-        # 方式C: 只带 user-token header（不带 cookie）
-        {
-            "url": "https://cupid.51job.com/open/noauth/job/search-pc",
-            "params": {"api_key": "51job", "keyword": "机械工程师", "jobArea": "000000",
-                       "pageNum": "1", "pageSize": "20", "timestamp": ts},
-            "headers": {"user-token": user_token} if user_token else None,
-        },
-        # 方式D: 换成可能的路径
-        {
-            "url": "https://cupid.51job.com/open/noauth/search-pc",
-            "params": {"api_key": "51job", "keyword": "机械工程师", "jobArea": "000000",
-                       "pageNum": "1", "pageSize": "20", "timestamp": ts},
-            "headers": {"Cookie": cookie_str},
-        },
-        # 方式E: 模仿 we.51job.com 的搜索 API 参数格式（但走 cupid 域名）
-        {
-            "url": "https://cupid.51job.com/api/job/search-pc",
-            "params": {"api_key": "51job", "keyword": "机械工程师", "searchType": "2",
-                       "sortType": "0", "jobArea": "000000", "pageNum": "1",
-                       "pageSize": "20", "timestamp": ts},
-            "headers": {"Cookie": cookie_str},
-        },
-        # 方式F: 使用浏览器捕获到的 cupid 推荐 API 格式来找搜索端点
-        {
-            "url": "https://cupid.51job.com/open/noauth/recommend/web",
-            "params": {"api_key": "51job", "keyword": "机械工程师", "timestamp": ts,
-                       "pageSize": "20", "pageNum": "1", "type": "search"},
-            "headers": {"Cookie": cookie_str},
-        },
+    # 通用请求头（模拟浏览器）
+    common_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "user-token": user_token,
+        "Referer": "https://we.51job.com/pc/search?keyword=机械工程师&jobArea=000000",
+        "Cookie": cookie_str,
+    }
+
+    # 完全模拟浏览器的 we.51job.com 搜索请求
+    print("\n--- 测试3A: we.51job.com 搜索API（完全模拟浏览器） ---")
+    params3a = {
+        "api_key": "51job",
+        "timestamp": ts,
+        "keyword": "机械工程师",
+        "searchType": "2",
+        "function": "",
+        "industry": "",
+        "jobArea": "000000",
+        "jobArea2": "",
+        "landmark": "",
+        "metro": "",
+        "salary": "",
+        "workYear": "",
+        "degree": "",
+        "companyType": "",
+        "companySize": "",
+        "jobType": "",
+        "issueDate": "",
+        "sortType": "0",
+        "pageNum": "1",
+        "pageSize": "20",
+    }
+    # HMAC 签名
+    qs = urlencode(params3a)
+    sig = _build_hmac_signature(f"/api/job/search-pc?{qs}")
+    full_url = f"https://we.51job.com/api/job/search-pc?{qs}&signature={sig}"
+    try:
+        resp = requests.get(full_url, headers=common_headers, timeout=15)
+        ct = resp.headers.get("Content-Type", "")
+        print(f"HTTP {resp.status_code} ({ct})")
+        if "aliyun_waf" in resp.text.lower():
+            print("✗ WAF 拦截（TLS 指纹检测，纯 HTTP 请求无法绕过）")
+        elif "application/json" in ct:
+            data = resp.json()
+            items = data.get("resultbody", {}).get("job", {}).get("items", [])
+            print(f"✓ 成功！{len(items)} 条职位")
+            if items:
+                print(f"  第一条: {items[0].get('jobName', '?')} — {items[0].get('fullCompanyName', '?')}")
+        else:
+            print(f"响应: {resp.text[:400]}")
+    except Exception as e:
+        print(f"失败: {e}")
+
+    # 测试3B: cupid 搜索端点 — 完全模拟浏览器，但不加 HMAC
+    print("\n--- 测试3B: cupid.51job.com 搜索端点（模拟浏览器，无签名） ---")
+    cupid_urls = [
+        "https://cupid.51job.com/open/noauth/job/search-pc",
+        "https://cupid.51job.com/api/job/search-pc",
     ]
-
-    for i, test in enumerate(cupid_tests):
-        if test["headers"] is None:
-            print(f"\n方式{chr(65+i)}: 跳过（无 token）")
-            continue
-        print(f"\n方式{chr(65+i)}: {test['url']}")
-        print(f"  params: {test['params']}")
-        print(f"  headers: {list(test['headers'].keys())}")
+    for url in cupid_urls:
+        print(f"\n尝试: {url}")
+        params = {"api_key": "51job", "timestamp": ts, "keyword": "机械工程师",
+                   "jobArea": "000000", "pageNum": "1", "pageSize": "20"}
         try:
-            qs = urlencode(test["params"])
-            full_url = f"{test['url']}?{qs}"
-            headers = {**test["headers"], "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            resp = requests.get(full_url, headers=headers, timeout=15)
+            qs = urlencode(params)
+            resp = requests.get(f"{url}?{qs}", headers=common_headers, timeout=15)
             ct = resp.headers.get("Content-Type", "")
-            print(f"  HTTP {resp.status_code} ({ct})")
-            if "application/json" in ct:
-                data = resp.json()
-                if data.get("resultbody"):
-                    items = data.get("resultbody", {}).get("job", {}).get("items", [])
-                    print(f"  ✓ 成功！{len(items)} 条职位")
-                    if items:
-                        print(f"  第一条: {items[0].get('jobName', '?')}")
-                    break
-                else:
-                    print(f"  响应: {json.dumps(data, ensure_ascii=False)[:300]}")
-            elif "aliyun_waf" in resp.text.lower():
-                print(f"  ✗ WAF 拦截")
-            else:
-                print(f"  响应: {resp.text[:300]}")
+            print(f"HTTP {resp.status_code} ({ct}): {resp.text[:400]}")
         except Exception as e:
-            print(f"  失败: {e}")
+            print(f"失败: {e}")
 
 
 if __name__ == "__main__":
