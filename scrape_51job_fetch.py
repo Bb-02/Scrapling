@@ -41,6 +41,13 @@ MAX_PAGES = 80
 PAGE_SIZE = 20
 DELAY_MIN = 0.5
 DELAY_MAX = 1.5
+SAFE_FETCH_LIMIT = 40  # requests before clearing WAF tracking cookies
+
+TRACKING_COOKIE_PATTERNS = [
+    "acw_tc", "ssxmod_itna", "sensorsdata", "sajssdk",
+    "Hm_lvt", "Hm_lpvt", "HMACCOUNT", "guid", "sensor",
+    "ps", "_c_WBKFRo",
+]
 
 PROVINCE_CODES: dict[str, str] = {
     "北京": "010000", "上海": "020000", "天津": "030000", "重庆": "040000",
@@ -386,6 +393,7 @@ async def crawl(
     phase = progress.get("phase", "scout")
     all_rows: list[dict] = progress.get("all_rows", [])
     seen_ids: set[str] = set(progress.get("seen_ids", []))
+    request_count = [0]  # mutable counter for _crawl_areas
 
     # Resume from saved output
     resume_path = OUTPUT_DIR / "fetch_output.xlsx"
@@ -461,8 +469,8 @@ async def crawl(
                 if phase == "scout":
                     before = len(all_rows)
                     await _crawl_areas(
-                        page, category, keyword, scout_areas,
-                        all_rows, seen_ids, logger,
+                        page, context, category, keyword, scout_areas,
+                        all_rows, seen_ids, request_count, logger,
                     )
                     progress["total"] = len(all_rows)
                     progress["seen_ids"] = list(seen_ids)
@@ -482,8 +490,8 @@ async def crawl(
 
                 elif phase == "full":
                     await _crawl_areas(
-                        page, category, keyword, full_areas,
-                        all_rows, seen_ids, logger,
+                        page, context, category, keyword, full_areas,
+                        all_rows, seen_ids, request_count, logger,
                     )
                     kw_idx += 1
                     area_idx = 0
@@ -513,15 +521,43 @@ async def crawl(
     logger.info("Done! Total: %d rows", len(all_rows))
 
 
+async def _clear_tracking_cookies(context, page, logger) -> int:
+    """Delete WAF tracking cookies, keep login cookies. Returns number deleted."""
+    cookies = await context.cookies()
+    deleted = 0
+    for c in cookies:
+        name = c["name"]
+        domain = c.get("domain", "")
+        if "51job" not in domain:
+            continue
+        is_tracking = any(name.startswith(p) or p in name for p in TRACKING_COOKIE_PATTERNS)
+        if is_tracking:
+            await context.clear_cookies(name=name, domain=domain)
+            deleted += 1
+    if deleted:
+        logger.info("Cleared %d tracking cookies, reloading page...", deleted)
+        await page.goto(
+            "https://we.51job.com/pc/search?keyword=%E6%9C%BA%E6%A2%B0%E5%B7%A5%E7%A8%8B%E5%B8%88&jobArea=000000",
+            wait_until="domcontentloaded",
+        )
+        await asyncio.sleep(3)
+    return deleted
+
+
 async def _crawl_areas(
-    page, category: str, keyword: str, areas: list[tuple[str, str]],
-    all_rows: list[dict], seen_ids: set[str], logger,
+    page, context, category: str, keyword: str, areas: list[tuple[str, str]],
+    all_rows: list[dict], seen_ids: set[str], request_count: list[int], logger,
 ):
     for ai, (area_name, area_code) in enumerate(areas):
         logger.info("  [%d/%d] %s @ %s(%s)", ai + 1, len(areas), keyword, area_name, area_code)
 
         # Paginate through all pages
         for page_num in range(1, MAX_PAGES + 1):
+            # Reset WAF counter before hitting limit
+            if request_count[0] >= SAFE_FETCH_LIMIT:
+                await _clear_tracking_cookies(context, page, logger)
+                request_count[0] = 0
+
             url = build_signed_url(keyword, area_code, page_num)
 
             # Random delay to avoid triggering captcha
@@ -529,6 +565,7 @@ async def _crawl_areas(
             await asyncio.sleep(delay)
 
             result = await _safe_fetch(page, url)
+            request_count[0] += 1
 
             if result.get("waf"):
                 logger.warning("WAF block at page %d!", page_num)
