@@ -37,17 +37,12 @@ PROGRESS_FILE = OUTPUT_DIR / "fetch_progress.json"
 
 HMAC_KEY = b"abfc8f9dcf8c3f3d8aa294ac5f2cf2cc7767e5592590f39c3f503271dd68562b"
 SEARCH_API_PATH = "/api/job/search-pc"
-MAX_PAGES = 80
-PAGE_SIZE = 20
+MAX_PAGES = 20  # with pageSize=100, 20 pages = 2000 max per area
+PAGE_SIZE = 100
 DELAY_MIN = 0.5
 DELAY_MAX = 1.5
-SAFE_FETCH_LIMIT = 40  # requests before clearing WAF tracking cookies
-
-TRACKING_COOKIE_PATTERNS = [
-    "acw_tc", "ssxmod_itna", "sensorsdata", "sajssdk",
-    "Hm_lvt", "Hm_lpvt", "HMACCOUNT", "guid", "sensor",
-    "ps", "_c_WBKFRo",
-]
+COOLDOWN_SECONDS = 900  # 15 minutes: IP rate limit recovery time
+CONSECUTIVE_EMPTY_THRESHOLD = 5  # trigger cooldown after this many empties
 
 PROVINCE_CODES: dict[str, str] = {
     "北京": "010000", "上海": "020000", "天津": "030000", "重庆": "040000",
@@ -213,15 +208,21 @@ def build_signed_url(keyword: str, job_area: str, page_num: int = 1) -> str:
 # ============================================================
 
 FETCH_PAGE_JS = """
-async (url) => {
+async (args) => {
+    const url = args.url;
+    const timeoutMs = args.timeoutMs || 30000;
     try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
         const resp = await fetch(url, {
             credentials: 'include',
+            signal: controller.signal,
             headers: {
                 'user-token': localStorage.getItem('token') || '',
                 'accept': 'application/json, text/plain, */*',
             }
         });
+        clearTimeout(timer);
         const text = await resp.text();
         if (text.includes('aliyun_waf')) {
             return { waf: true };
@@ -237,7 +238,7 @@ async (url) => {
             pageNum: job.pageNum || 0,
         };
     } catch(e) {
-        return { error: e.message };
+        return { error: e.message || e.toString() };
     }
 }
 """
@@ -306,10 +307,10 @@ def build_row(idx: int, item: dict, category: str) -> dict:
     else:
         tags_str = str(tags) if tags else ""
 
-    # industry
+    # industry — prefer string name over numeric ID
     func_types = []
     for k in ("industryType1", "industryType2"):
-        v = item.get(k, "") or item.get(k + "Str", "")
+        v = item.get(k + "Str", "") or item.get(k, "")
         if v and v not in func_types:
             func_types.append(v)
 
@@ -393,7 +394,6 @@ async def crawl(
     phase = progress.get("phase", "scout")
     all_rows: list[dict] = progress.get("all_rows", [])
     seen_ids: set[str] = set(progress.get("seen_ids", []))
-    request_count = [0]  # mutable counter for _crawl_areas
 
     # Resume from saved output
     resume_path = OUTPUT_DIR / "fetch_output.xlsx"
@@ -432,9 +432,6 @@ async def crawl(
         await asyncio.sleep(5)
 
         has_token = await page.evaluate("() => !!localStorage.getItem('token')")
-        job_items = await page.evaluate("() => document.querySelectorAll('.joblist-item').length")
-        logger.info("Page: %d job items, logged in: %s", job_items, has_token)
-
         if not has_token:
             print("\n[LOGIN REQUIRED] Please login in the browser, then press Enter...")
             input()
@@ -446,14 +443,20 @@ async def crawl(
                 return
             logger.info("Login OK")
 
-        if job_items == 0:
-            logger.warning("0 job items on page. Check if IP is blocked.")
-            print("Check browser: can you see job listings? Press Enter to continue or Ctrl+C to abort.")
-            try:
-                input()
-            except KeyboardInterrupt:
+        # If page loaded WAF/captcha instead of search results, auto-cooldown
+        while not await _check_page_ok(page):
+            logger.warning("Startup: page is on WAF/captcha! IP may still be blocked.")
+            await _close_page(page)
+            await _cool_down(logger, "startup WAF page")
+            page = await _open_search_page(context)
+            has_token = await page.evaluate("() => !!localStorage.getItem('token')")
+            if not has_token:
+                logger.error("Login lost after cooldown. Exiting.")
                 await context.close()
                 return
+
+        job_items = await page.evaluate("() => document.querySelectorAll('.joblist-item').length")
+        logger.info("Page: %d job items, logged in: %s", job_items, has_token)
 
         # Main crawl loop
         total_kw = len(keywords)
@@ -468,9 +471,9 @@ async def crawl(
 
                 if phase == "scout":
                     before = len(all_rows)
-                    await _crawl_areas(
-                        page, context, category, keyword, scout_areas,
-                        all_rows, seen_ids, request_count, logger,
+                    page = await _crawl_areas(
+                        context, page, category, keyword, scout_areas,
+                        all_rows, seen_ids, logger,
                     )
                     progress["total"] = len(all_rows)
                     progress["seen_ids"] = list(seen_ids)
@@ -489,9 +492,9 @@ async def crawl(
                                    area_idx=area_idx, phase=phase)
 
                 elif phase == "full":
-                    await _crawl_areas(
-                        page, context, category, keyword, full_areas,
-                        all_rows, seen_ids, request_count, logger,
+                    page = await _crawl_areas(
+                        context, page, category, keyword, full_areas,
+                        all_rows, seen_ids, logger,
                     )
                     kw_idx += 1
                     area_idx = 0
@@ -521,70 +524,62 @@ async def crawl(
     logger.info("Done! Total: %d rows", len(all_rows))
 
 
-async def _clear_tracking_cookies(context, page, logger) -> int:
-    """Delete WAF tracking cookies, keep login cookies. Returns number deleted."""
-    cookies = await context.cookies()
-    deleted = 0
-    for c in cookies:
-        name = c["name"]
-        domain = c.get("domain", "")
-        if "51job" not in domain:
-            continue
-        is_tracking = any(name.startswith(p) or p in name for p in TRACKING_COOKIE_PATTERNS)
-        if is_tracking:
-            await context.clear_cookies(name=name, domain=domain)
-            deleted += 1
-    if deleted:
-        logger.info("Cleared %d tracking cookies, reloading page...", deleted)
-        await page.goto(
-            "https://we.51job.com/pc/search?keyword=%E6%9C%BA%E6%A2%B0%E5%B7%A5%E7%A8%8B%E5%B8%88&jobArea=000000",
-            wait_until="domcontentloaded",
-        )
-        await asyncio.sleep(3)
-    return deleted
-
-
 async def _crawl_areas(
-    page, context, category: str, keyword: str, areas: list[tuple[str, str]],
-    all_rows: list[dict], seen_ids: set[str], request_count: list[int], logger,
+    context, page, category: str, keyword: str, areas: list[tuple[str, str]],
+    all_rows: list[dict], seen_ids: set[str], logger,
 ):
+    empty_streak = 0
+
     for ai, (area_name, area_code) in enumerate(areas):
         logger.info("  [%d/%d] %s @ %s(%s)", ai + 1, len(areas), keyword, area_name, area_code)
 
-        # Paginate through all pages
         for page_num in range(1, MAX_PAGES + 1):
-            # Reset WAF counter before hitting limit
-            if request_count[0] >= SAFE_FETCH_LIMIT:
-                await _clear_tracking_cookies(context, page, logger)
-                request_count[0] = 0
+            if empty_streak >= CONSECUTIVE_EMPTY_THRESHOLD:
+                await _close_page(page)
+                await _cool_down(logger, f"{empty_streak} consecutive empties")
+                page = await _open_search_page(context)
+                empty_streak = 0
+
+            # Check if page is still on 51job before fetching
+            if not await _check_page_ok(page):
+                await _close_page(page)
+                await _cool_down(logger, "page on WAF/captcha URL")
+                page = await _open_search_page(context)
+                empty_streak = 0
 
             url = build_signed_url(keyword, area_code, page_num)
-
-            # Random delay to avoid triggering captcha
             delay = random.uniform(DELAY_MIN, DELAY_MAX)
             await asyncio.sleep(delay)
 
             result = await _safe_fetch(page, url)
-            request_count[0] += 1
 
             if result.get("waf"):
-                logger.warning("WAF block at page %d!", page_num)
-                break
+                await _close_page(page)
+                await _cool_down(logger, f"WAF block at page {page_num}")
+                page = await _open_search_page(context)
+                empty_streak = 0
+                continue
 
             if result.get("error"):
-                logger.warning("Fetch error at page %d: %s", page_num, result["error"])
-                # If page navigated (captcha), pause and wait
-                if "navigated" in str(result.get("error", "")):
-                    print("\n[CAPTCHA?] Browser page changed. Solve captcha if shown, then press Enter...")
-                    input()
+                err_msg = result["error"]
+                logger.warning("Fetch error at page %d: %s", page_num, err_msg)
+                if any(kw in str(err_msg) for kw in ("navigated", "timeout", "Target closed")):
+                    await _close_page(page)
+                    await _cool_down(logger, f"fetch error: {err_msg}")
+                    page = await _open_search_page(context)
+                    empty_streak = 0
                     continue
+                # Unknown error — don't retry this area
                 break
 
             items = result.get("items", [])
             total_count = result.get("totalCount", 0)
 
             if not items:
-                break  # no more results
+                empty_streak += 1
+                break  # no more results for this area
+
+            empty_streak = 0  # reset streak on success
 
             new_count = 0
             for item in items:
@@ -603,15 +598,67 @@ async def _crawl_areas(
         # Brief pause between areas
         await asyncio.sleep(random.uniform(1.0, 2.0))
 
+    return page  # may have been replaced after cooldown
 
-async def _safe_fetch(page, url: str) -> dict:
+
+async def _safe_fetch(page, url: str, timeout_ms: int = 30000) -> dict:
     try:
-        return await page.evaluate(FETCH_PAGE_JS, url)
+        return await asyncio.wait_for(
+            page.evaluate(FETCH_PAGE_JS, {"url": url, "timeoutMs": timeout_ms}),
+            timeout=(timeout_ms / 1000) + 5,  # Python timeout slightly longer than JS
+        )
+    except asyncio.TimeoutError:
+        return {"error": "fetch_timeout"}
     except Exception as e:
         msg = str(e)
         if "navigation" in msg.lower() or "destroyed" in msg.lower():
             return {"error": "page_navigated"}
         return {"error": msg[:100]}
+
+async def _check_page_ok(page) -> bool:
+    """Return False if page has been redirected to WAF/captcha."""
+    try:
+        url = page.url
+        if "aliyun" in url.lower() or "cfjet" in url.lower() or "challenge" in url.lower():
+            return False
+        if "we.51job.com" not in url:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def _cool_down(logger, reason: str):
+    """Sleep COOLDOWN_SECONDS with progress logging every 3 min."""
+    logger.warning("Cooling down %ds (%s)...", COOLDOWN_SECONDS, reason)
+    remaining = COOLDOWN_SECONDS
+    while remaining > 0:
+        chunk = min(180, remaining)  # log every 3 minutes
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+        if remaining > 0:
+            logger.info("  Cooldown: %d min remaining...", remaining // 60)
+    logger.info("Cooldown done, reloading page...")
+
+
+async def _close_page(page):
+    """Safely close a page. Returns None (caller should not use the closed page)."""
+    try:
+        await page.close()
+    except Exception:
+        pass
+    return None
+
+
+async def _open_search_page(context):
+    """Create a fresh page and navigate to 51job search."""
+    new_page = await context.new_page()
+    await new_page.goto(
+        "https://we.51job.com/pc/search?keyword=%E6%9C%BA%E6%A2%B0%E5%B7%A5%E7%A8%8B%E5%B8%88&jobArea=000000",
+        wait_until="domcontentloaded",
+    )
+    await asyncio.sleep(4)
+    return new_page
 
 
 def _save_output(rows: list[dict]) -> None:
