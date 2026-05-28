@@ -1,2 +1,3 @@
-2026/05/28-11:25:08.040 50a4 Creating DB D:\ShiRongBaiGong_Data\Scrapling\Scrapling\chrome_profile\Default\Sync Data\LevelDB since it was missing.
-2026/05/28-11:25:08.048 50a4 Reusing MANIFEST D:\ShiRongBaiGong_Data\Scrapling\Scrapling\chrome_profile\Default\Sync Data\LevelDB/MANIFEST-000001
+2026/05/28-18:50:53.720 5328 Reusing MANIFEST D:\ShiRongBaiGong_Data\Scrapling\Scrapling\chrome_profile\Default\Sync Data\LevelDB/MANIFEST-000001
+2026/05/28-18:50:53.721 5328 Recovering log #3
+2026/05/28-18:50:53.721 5328 Reusing old log D:\ShiRongBaiGong_Data\Scrapling\Scrapling\chrome_profile\Default\Sync Data\LevelDB/000003.log 

@@ -603,8 +603,8 @@ def main():
     parser.add_argument("--keywords", type=str, nargs="*", default=None,
                        help="Specific keywords (overrides category)")
     parser.add_argument("--no-scout", action="store_true", default=False)
-    parser.add_argument("--delay-min", type=float, default=DELAY_MIN)
-    parser.add_argument("--delay-max", type=float, default=DELAY_MAX)
+    parser.add_argument("--delay-min", type=float, default=0.5)
+    parser.add_argument("--delay-max", type=float, default=1.5)
     args = parser.parse_args()
 
     global DELAY_MIN, DELAY_MAX
