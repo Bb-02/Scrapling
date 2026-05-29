@@ -1,17 +1,18 @@
 """
 51job crawler using cupid.51job.com noauth search API.
-No browser, no login, no WAF slider. Pure HTTP requests.
+No browser, no login. Pure HTTP requests with 1.5s delay = no WAF trigger.
 
 Usage:
-    python cupid_search_crawler.py                     # full crawl
-    python cupid_search_crawler.py --category 工程/机械  # specific category
+    python cupid_search_crawler.py                     # all 7 categories, 117 keywords
+    python cupid_search_crawler.py --category 工程/机械  # single category
+    python cupid_search_crawler.py --delay 2.0          # custom delay
+    python cupid_search_crawler.py --no-scout           # skip scout, full 34 provinces
 
-Shares progress with scrape_51job_fetch.py — same output dir, same format.
+Output: ../output/cupid_output.xlsx + cupid_progress.json
+Resume: just re-run the same command — auto-resumes from progress.
 """
 
 import argparse
-import hashlib
-import hmac
 import json
 import logging
 import re
@@ -20,7 +21,6 @@ import time
 import random
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
 
 import pandas as pd
 import requests
@@ -36,9 +36,15 @@ PROGRESS_FILE = OUTPUT_DIR / "cupid_progress.json"
 
 API_URL = "https://cupid.51job.com/pc/open/noauth/search-h5"
 PAGE_SIZE = 200
-DELAY_SEC = 1.0  # between requests; lower = more empty responses
+DELAY_SEC = 1.5  # safe rate for continuous running (never triggers WAF)
 MAX_EMPTY_RETRIES = 3  # retry empty responses before moving on
 MAX_PAGES = 50  # safety cap
+COOLDOWN_SECONDS = 2100  # 35 min wait when WAF blocks (WAF Max-Age=1800s, add margin)
+MAX_CONSECUTIVE_COOLDOWNS = 3  # exit if blocked this many times in a row
+
+
+class WafBlocked(Exception):
+    """Raised when cupid API returns 405 (WAF block)."""
 
 PROVINCE_CODES: dict[str, str] = {
     "北京": "010000", "上海": "020000", "天津": "030000", "重庆": "040000",
@@ -152,21 +158,46 @@ CITY_PROVINCE: dict[str, str] = {
 # ============================================================
 
 CATEGORIES: dict[str, list[str]] = {
+    "项目经理/管理": [
+        "机械项目管理", "汽车项目管理", "通信项目管理", "项目助理",
+        "项目工程师", "项目总监", "ERP 实施顾问", "建筑工程管理 / 项目经理",
+        "项目经理", "生产项目经理", "项目主管",
+    ],
     "工程/机械": [
-        "机械工程师", "机电工程师", "结构工程师", "模具工程师", "设备工程师",
-        "机械设计", "机械绘图员", "机械维修", "机械工艺", "机械制图",
-        "机械自动化", "电气工程师", "自动化工程师", "工业工程师", "材料工程师",
-        "焊接工程师", "铸造工程师", "锻造工程师", "冲压工程师", "注塑工程师",
-        "CNC工程师", "数控编程", "质量管理", "质量工程师", "机械质检",
-        "工程监理", "工程项目管理", "土木工程", "建筑工程", "暖通工程师",
-        "给排水工程师", "水利工程", "岩土工程", "测绘工程师", "安全工程师",
-        "焊接", "钣金", "车工", "磨工", "铣工", "钳工", "电焊工",
-        "装配工", "维修工", "电工", "技工", "操作工", "生产技术",
-        "工艺工程师", "PE工程师", "IE工程师", "NPI工程师", "ME工程师",
-        "测试工程师", "可靠性工程师", "实验室技术员", "工程经理", "项目工程师",
-        "研发工程师", "产品工程师", "制冷工程师", "热能工程师", "液压工程师",
-        "气动工程师", "船舶工程师", "汽车工程师", "医疗器械工程师",
-        "仪器仪表工程师", "机器人工程师", "无人机工程师",
+        "机械工程师", "机械研发工程师", "机械结构工程师", "CNC / 数控操机",
+        "机电工程师", "机械制图", "机械研发经理 / 主管", "机械装配工程师",
+        "CNC / 数控编程", "实验室负责人 / 工程师", "焊接工程师", "机械产品工程师",
+        "飞行器设计与制造", "船舶工程师", "工艺 / 制程工程师", "机械设备工程师",
+        "机械项目管理", "机械设计", "工业工程师", "模具工程师", "材料工程师",
+        "注塑工程师", "机械设备经理 / 主管", "模具设计", "夹具工程师",
+        "铸造 / 锻造工程师 / 技师", "机械维修 / 保养", "冲压工程师",
+        "光源与照明工程", "轨道交通工程师", "CAD 绘图", "热能工程师",
+        "飞机维修机械师", "仿真应用工程师",
+    ],
+    "普工": [
+        "普工 / 操作工", "包装工", "搬运工", "组装工", "学徒工", "装卸工",
+    ],
+    "技工": [
+        "电工", "空调工", "电梯工", "水工", "仪表工", "机修工", "锅炉工",
+        "木工", "技工", "喷塑工",
+    ],
+    "运输设备操作": [
+        "叉车司机", "铲车司机", "吊车司机", "挖掘机司机",
+    ],
+    "机械加工": [
+        "焊工", "CNC / 数控操机", "车工", "切割技工", "铣工", "抛光工",
+        "冲压工", "氩弧焊工", "钳工", "模具工", "磨工", "注塑工",
+        "折弯工", "钣金工", "钻工", "电镀工 / 镀膜操作", "镗工",
+        "炼胶工", "刨工", "铆工", "模切工", "吹膜工", "硫化工", "技工",
+    ],
+    "质量管理": [
+        "质检员 QC", "质量 / 品质主管", "EHS 安全工程师", "体系工程师",
+        "生产安全员", "体系认证审核员", "采购材料、设备质量", "质量工程师",
+        "质量 / 品质经理", "EHS 安全经理 / 主管", "计量工程师",
+        "供应商质量工程师", "认证工程师", "服装纺织质检员 (QA/QC)",
+        "汽车质量工程师", "客户质量工程师", "前期质量工程师", "过程质量工程师",
+        "药品生产 / 质量管理", "医疗器械生产 / 质量相关岗位",
+        "化学分析测试员", "可靠度工程师", "故障分析工程师",
     ],
 }
 
@@ -303,9 +334,18 @@ def load_progress() -> dict:
 
 
 def save_progress(progress: dict) -> None:
+    """Save only metadata + seen_ids (not all_rows — those go to Excel)."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    slim = {
+        "cat_idx": progress.get("cat_idx", 0),
+        "kw_idx": progress.get("kw_idx", 0),
+        "area_idx": progress.get("area_idx", 0),
+        "phase": progress.get("phase", "scout"),
+        "total": progress.get("total", 0),
+        "seen_ids": progress.get("seen_ids", []),
+    }
     with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump(progress, f, ensure_ascii=False, indent=2)
+        json.dump(slim, f, ensure_ascii=False, indent=2)
 
 
 # ============================================================
@@ -325,7 +365,7 @@ HEADERS = {
 
 def api_search(keyword: str, job_area: str, page_num: int,
                page_size: int = PAGE_SIZE) -> dict:
-    """Call cupid search-h5 API. Returns {"items": [...], "totalCount": N} or empty dict."""
+    """Call cupid search-h5 API. Returns {"items": [...], "totalCount": N} or {"waf": True}."""
     ts = str(int(time.time() * 1000))
     params = {
         "api_key": "51job",
@@ -338,6 +378,10 @@ def api_search(keyword: str, job_area: str, page_num: int,
     }
     try:
         resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=20)
+        if resp.status_code == 405:
+            return {"items": [], "totalCount": 0, "waf": True}
+        if "application/json" not in (resp.headers.get("content-type") or ""):
+            return {"items": [], "totalCount": 0, "waf": True, "waf_detail": f"HTTP {resp.status_code} non-JSON"}
         resp.raise_for_status()
         data = resp.json()
         job = data.get("resultbody", {}).get("job", {})
@@ -345,15 +389,21 @@ def api_search(keyword: str, job_area: str, page_num: int,
             "items": job.get("items") or [],
             "totalCount": job.get("totalCount") or 0,
         }
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 405:
+            return {"items": [], "totalCount": 0, "waf": True}
+        return {"items": [], "totalCount": 0, "error": str(e)}
     except Exception as e:
         return {"items": [], "totalCount": 0, "error": str(e)}
 
 
 def api_search_with_retry(keyword: str, job_area: str, page_num: int,
                            logger, max_retries: int = MAX_EMPTY_RETRIES) -> dict:
-    """Call API with retry on empty responses (silent throttling)."""
+    """Call API with retry on empty responses. WAF blocks are returned immediately."""
     for attempt in range(max_retries + 1):
         result = api_search(keyword, job_area, page_num)
+        if result.get("waf"):
+            return result  # no retry — retrying resets WAF timer
         if result.get("error"):
             logger.warning("API error: %s (attempt %d/%d)",
                           result["error"], attempt + 1, max_retries + 1)
@@ -391,8 +441,8 @@ def crawl(
     all_rows: list[dict] = progress.get("all_rows", [])
     seen_ids: set[str] = set(progress.get("seen_ids", []))
 
-    # Resume from saved output — use jobId for dedup (cross-API compatible)
-    resume_path = OUTPUT_DIR / "fetch_output.xlsx"
+    # Resume from saved output — use jobId for dedup
+    resume_path = OUTPUT_DIR / "cupid_output.xlsx"
     if resume_path.exists() and not all_rows:
         try:
             df = pd.read_excel(resume_path)
@@ -402,6 +452,9 @@ def crawl(
                 if jid and jid not in seen_ids:
                     seen_ids.add(jid)
                     all_rows.append(d)
+            # Fix indices after resume
+            for i, row in enumerate(all_rows):
+                row["序号"] = i + 1
             logger.info("Resumed %d rows from %s", len(all_rows), resume_path.name)
         except Exception as e:
             logger.warning("Could not resume from Excel: %s", e)
@@ -426,60 +479,96 @@ def crawl(
                 total_kw, len(scout_areas), len(full_areas))
     logger.info("API: %s, pageSize=%d, delay=%.1fs", API_URL, PAGE_SIZE, DELAY_SEC)
 
+    cooldown_streak = 0
+
     try:
         while kw_idx < total_kw:
             category, keyword = keywords[kw_idx]
             logger.info("[%d/%d] category=%s keyword=%s phase=%s",
                        kw_idx + 1, total_kw, category, keyword, phase)
 
-            if phase == "scout":
-                before = len(all_rows)
-                crawl_areas(
-                    category, keyword, scout_areas,
-                    all_rows, seen_ids, logger,
-                )
+            try:
+                if phase == "scout":
+                    before = len(all_rows)
+                    crawl_areas(
+                        category, keyword, scout_areas,
+                        all_rows, seen_ids, logger,
+                    )
+                    progress["total"] = len(all_rows)
+                    progress["seen_ids"] = list(seen_ids)
+
+                    if no_scout or len(all_rows) > before:
+                        logger.info("Scout passed (+%d rows), starting full crawl",
+                                   len(all_rows) - before)
+                        phase = "full"
+                        area_idx = 0
+                    else:
+                        logger.info("Scout empty, skipping keyword")
+                        kw_idx += 1
+                        area_idx = 0
+                        phase = "scout"
+                    progress.update(cat_idx=cat_idx, kw_idx=kw_idx,
+                                   area_idx=area_idx, phase=phase)
+
+                elif phase == "full":
+                    remaining = full_areas[area_idx:]
+                    last_ai = crawl_areas(
+                        category, keyword, remaining,
+                        all_rows, seen_ids, logger,
+                        area_offset=area_idx,
+                    )
+                    area_idx = area_idx + last_ai
+                    if area_idx >= len(full_areas):
+                        kw_idx += 1
+                        area_idx = 0
+                        phase = "scout"
+                    progress["total"] = len(all_rows)
+                    progress["seen_ids"] = list(seen_ids)
+                    progress.update(cat_idx=cat_idx, kw_idx=kw_idx,
+                                   area_idx=area_idx, phase=phase)
+
+                # Auto-save every keyword
+                cooldown_streak = 0  # reset on success
+                save_progress(progress)
+                _save_output(all_rows)
+                logger.info("Saved: %d total rows", len(all_rows))
+
+            except WafBlocked:
                 progress["total"] = len(all_rows)
                 progress["seen_ids"] = list(seen_ids)
-
-                if no_scout or len(all_rows) > before:
-                    logger.info("Scout passed (+%d rows), starting full crawl",
-                               len(all_rows) - before)
-                    phase = "full"
-                    area_idx = 0
-                else:
-                    logger.info("Scout empty, skipping keyword")
-                    kw_idx += 1
-                    area_idx = 0
-                    phase = "scout"
                 progress.update(cat_idx=cat_idx, kw_idx=kw_idx,
                                area_idx=area_idx, phase=phase)
+                save_progress(progress)
+                _save_output(all_rows)
+                logger.warning("Progress saved before cooldown: %d rows", len(all_rows))
 
-            elif phase == "full":
-                remaining = full_areas[area_idx:]
-                last_ai = crawl_areas(
-                    category, keyword, remaining,
-                    all_rows, seen_ids, logger,
-                    area_offset=area_idx,
+                cooldown_streak += 1
+                if cooldown_streak > MAX_CONSECUTIVE_COOLDOWNS:
+                    logger.error(
+                        "Blocked %d times in a row — giving up. "
+                        "Re-run later when IP is clean.",
+                        cooldown_streak - 1,
+                    )
+                    sys.exit(1)
+
+                logger.warning(
+                    "WAF cooldown #%d: waiting %.0f min (%d seconds)...",
+                    cooldown_streak, COOLDOWN_SECONDS / 60, COOLDOWN_SECONDS,
                 )
-                area_idx = area_idx + last_ai
-                if area_idx >= len(full_areas):
-                    kw_idx += 1
-                    area_idx = 0
-                    phase = "scout"
-                progress["total"] = len(all_rows)
-                progress["seen_ids"] = list(seen_ids)
-                progress.update(cat_idx=cat_idx, kw_idx=kw_idx,
-                               area_idx=area_idx, phase=phase)
-
-            # Auto-save every keyword
-            save_progress(progress)
-            _save_output(all_rows)
-            logger.info("Saved: %d total rows", len(all_rows))
+                # Sleep but check every 60s in case user hits Ctrl+C
+                remaining_sleep = COOLDOWN_SECONDS
+                while remaining_sleep > 0:
+                    chunk = min(60, remaining_sleep)
+                    time.sleep(chunk)
+                    remaining_sleep -= chunk
+                logger.info("Cooldown done, resuming...")
 
     except KeyboardInterrupt:
         logger.warning("Interrupted. Saving progress...")
         progress["total"] = len(all_rows)
         progress["seen_ids"] = list(seen_ids)
+        progress.update(cat_idx=cat_idx, kw_idx=kw_idx,
+                       area_idx=area_idx, phase=phase)
         save_progress(progress)
         _save_output(all_rows)
         logger.info("Progress saved. Resume with: python cupid_search_crawler.py")
@@ -493,9 +582,8 @@ def crawl_areas(
     all_rows: list[dict], seen_ids: set[str], logger,
     area_offset: int = 0,
 ) -> int:
-    """Crawl areas for one keyword. Returns last area index processed (relative)."""
+    """Crawl areas for one keyword. Returns number of areas processed."""
     request_count = 0
-    empty_areas = 0
 
     for ai, (area_name, area_code) in enumerate(areas):
         logger.info("  [%d/%d] %s @ %s(%s)",
@@ -506,14 +594,15 @@ def crawl_areas(
             result = api_search_with_retry(keyword, area_code, page_num, logger)
             request_count += 1
 
+            if result.get("waf"):
+                logger.warning("WAF block detected at %s page %d!", area_name, page_num)
+                raise WafBlocked()
+
             items = result.get("items", [])
             total_count = result.get("totalCount", 0)
 
             if not items:
-                empty_areas += 1
                 break
-
-            empty_areas = 0
 
             new_count = 0
             for item in items:
@@ -547,10 +636,10 @@ def _save_output(rows: list[dict]) -> None:
     columns = read_template_columns()
     df = pd.DataFrame(rows, columns=columns)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = OUTPUT_DIR / f"fetch_output_{stamp}.xlsx"
+    path = OUTPUT_DIR / f"cupid_output_{stamp}.xlsx"
     df.to_excel(path, index=False, sheet_name="Sheet1")
 
-    latest = OUTPUT_DIR / "fetch_output.xlsx"
+    latest = OUTPUT_DIR / "cupid_output.xlsx"
     df.to_excel(latest, index=False, sheet_name="Sheet1")
 
 
@@ -567,12 +656,14 @@ def all_keywords() -> list[tuple[str, str]]:
 
 
 def main():
+    global DELAY_SEC
     parser = argparse.ArgumentParser(description="51job cupid API crawler")
     parser.add_argument("--category", type=str, default=None)
     parser.add_argument("--keywords", type=str, nargs="*", default=None)
     parser.add_argument("--no-scout", action="store_true", default=False)
     parser.add_argument("--delay", type=float, default=DELAY_SEC)
     args = parser.parse_args()
+    DELAY_SEC = args.delay
 
     logging.basicConfig(
         level=logging.INFO,
@@ -590,7 +681,7 @@ def main():
     elif args.category:
         logger.error("Unknown category: %s. Available: %s",
                     args.category, list(CATEGORIES.keys()))
-        return
+        sys.exit(1)
     else:
         keywords = all_keywords()
 
@@ -602,6 +693,7 @@ def main():
     logger.info("  Keywords: %d", len(keywords))
     logger.info("  Areas: %d provinces + %d scout", len(areas), len(scout_areas))
     logger.info("  API: %s", API_URL)
+    logger.info("  Delay: %.1fs, PageSize: %d", DELAY_SEC, PAGE_SIZE)
     logger.info("  Scout pruning: %s", "OFF" if args.no_scout else "ON")
     logger.info("=" * 60)
 
@@ -609,4 +701,4 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
