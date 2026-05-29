@@ -1,11 +1,12 @@
 """
-51job crawler using browser-internal fetch() API calls.
-Single browser process, persistent login, far fewer WAF issues.
+51job crawler — COOLDOWN variant for unattended / overnight runs.
+Shares progress with scrape_51job_fetch.py (same output dir, same format).
+Swap freely: hotspot by day, cooldown overnight.
 
 Usage:
-    python scrape_51job_fetch.py                     # full crawl
-    python scrape_51job_fetch.py --category 工程/机械  # specific category
-    python scrape_51job_fetch.py --no-scout           # skip scout pruning
+    python scrape_51job_fetch_cooldown.py                     # full crawl
+    python scrape_51job_fetch_cooldown.py --category 工程/机械  # specific category
+    python scrape_51job_fetch_cooldown.py --no-scout           # skip scout pruning
 """
 
 import argparse
@@ -41,12 +42,8 @@ MAX_PAGES = 20  # with pageSize=100, 20 pages = 2000 max per area
 PAGE_SIZE = 100
 DELAY_MIN = 0.5
 DELAY_MAX = 1.5
-CONSECUTIVE_EMPTY_THRESHOLD = 5  # trigger hotspot refresh after this many empty areas
-MAX_FETCHES_PER_IP = 40  # stop before WAF limit (~48), reconnect hotspot for new IP
-
-
-class HotspotRefreshNeeded(Exception):
-    """Raised when fetch count reaches MAX_FETCHES_PER_IP to request IP refresh."""
+CONSECUTIVE_EMPTY_THRESHOLD = 5  # trigger cooldown after this many empty areas
+COOLDOWN_SECONDS = 2400  # 40 minutes: wait for WAF block to clear
 
 PROVINCE_CODES: dict[str, str] = {
     "北京": "010000", "上海": "020000", "天津": "030000", "重庆": "040000",
@@ -447,19 +444,23 @@ async def crawl(
                 return
             logger.info("Login OK")
 
-        # Startup: if page is on WAF/captcha, IP is still blocked — reconnect hotspot
-        if not await _check_page_ok(page):
-            logger.error("Startup: page is on WAF/captcha! IP still blocked.")
-            logger.error("Reconnect hotspot for a new IP, then re-run.")
-            await context.close()
-            return
+        # If page loaded WAF/captcha — cooldown and retry
+        while not await _check_page_ok(page):
+            logger.warning("Startup: page is on WAF/captcha! IP blocked, cooling down...")
+            await _close_page(page)
+            await _cool_down(logger, "startup WAF page")
+            page = await _open_search_page(context)
+            has_token = await page.evaluate("() => !!localStorage.getItem('token')")
+            if not has_token:
+                logger.error("Login lost after cooldown. Exiting.")
+                await context.close()
+                return
 
         job_items = await page.evaluate("() => document.querySelectorAll('.joblist-item').length")
         logger.info("Page: %d job items, logged in: %s", job_items, has_token)
 
         # Main crawl loop
         total_kw = len(keywords)
-        fetch_count = [0]  # mutable counter shared across _crawl_areas calls
         area_idx_ref = [0]  # mutable tracker for current area index
         logger.info("Starting crawl: %d keywords, %d scout areas, %d full areas",
                     total_kw, len(scout_areas), len(full_areas))
@@ -473,9 +474,8 @@ async def crawl(
                 if phase == "scout":
                     before = len(all_rows)
                     page = await _crawl_areas(
-                        page, category, keyword, scout_areas,
+                        context, page, category, keyword, scout_areas,
                         all_rows, seen_ids, logger,
-                        fetch_count=fetch_count,
                     )
                     progress["total"] = len(all_rows)
                     progress["seen_ids"] = list(seen_ids)
@@ -497,9 +497,8 @@ async def crawl(
                     # Resume from saved area_idx, don't repeat completed areas
                     remaining = full_areas[area_idx:]
                     page = await _crawl_areas(
-                        page, category, keyword, remaining,
+                        context, page, category, keyword, remaining,
                         all_rows, seen_ids, logger,
-                        fetch_count=fetch_count,
                         area_idx_ref=area_idx_ref,
                         area_offset=area_idx,
                     )
@@ -518,19 +517,6 @@ async def crawl(
                 _save_output(all_rows)
                 logger.info("Saved: %d total rows", len(all_rows))
 
-        except HotspotRefreshNeeded:
-            logger.warning("IP refresh needed. Saving progress...")
-            # Use accurate area_idx from the tracker
-            saved_area = area_idx_ref[0] if phase == "full" else area_idx
-            progress.update(cat_idx=cat_idx, kw_idx=kw_idx, area_idx=saved_area, phase=phase)
-            progress["total"] = len(all_rows)
-            progress["seen_ids"] = list(seen_ids)
-            save_progress(progress)
-            _save_output(all_rows)
-            logger.info("=" * 60)
-            logger.info("Reconnect hotspot now for a new IP, then re-run:")
-            logger.info("  python scrape_51job_fetch.py")
-            logger.info("=" * 60)
         except KeyboardInterrupt:
             logger.warning("Interrupted. Saving progress...")
             saved_area = area_idx_ref[0] if phase == "full" else area_idx
@@ -539,7 +525,7 @@ async def crawl(
             progress["seen_ids"] = list(seen_ids)
             save_progress(progress)
             _save_output(all_rows)
-            logger.info("Progress saved. Resume with: python scrape_51job_fetch.py")
+            logger.info("Progress saved. Resume with: python scrape_51job_fetch_cooldown.py")
         finally:
             await context.close()
 
@@ -548,9 +534,8 @@ async def crawl(
 
 
 async def _crawl_areas(
-    page, category: str, keyword: str, areas: list[tuple[str, str]],
+    context, page, category: str, keyword: str, areas: list[tuple[str, str]],
     all_rows: list[dict], seen_ids: set[str], logger,
-    fetch_count: list[int] | None = None,
     area_idx_ref: list[int] | None = None,
     area_offset: int = 0,
 ):
@@ -563,14 +548,17 @@ async def _crawl_areas(
 
         for page_num in range(1, MAX_PAGES + 1):
             if empty_streak >= CONSECUTIVE_EMPTY_THRESHOLD:
-                logger.info("  %d consecutive empty areas — IP might be throttled, saving & exiting",
-                           empty_streak)
-                raise HotspotRefreshNeeded()
+                await _close_page(page)
+                await _cool_down(logger, f"{empty_streak} consecutive empties")
+                page = await _open_search_page(context)
+                empty_streak = 0
 
             # Check if page is still on 51job before fetching
             if not await _check_page_ok(page):
-                logger.warning("Page redirected to WAF/captcha — refreshing IP")
-                raise HotspotRefreshNeeded()
+                await _close_page(page)
+                await _cool_down(logger, "page on WAF/captcha URL")
+                page = await _open_search_page(context)
+                empty_streak = 0
 
             url = build_signed_url(keyword, area_code, page_num)
             delay = random.uniform(DELAY_MIN, DELAY_MAX)
@@ -578,22 +566,24 @@ async def _crawl_areas(
 
             result = await _safe_fetch(page, url)
 
-            if fetch_count is not None:
-                fetch_count[0] += 1
-                if fetch_count[0] >= MAX_FETCHES_PER_IP:
-                    logger.warning("Reached %d fetches — refresh hotspot for new IP",
-                                   fetch_count[0])
-                    raise HotspotRefreshNeeded()
-
             if result.get("waf"):
-                logger.warning("WAF block in fetch response — refreshing IP")
-                raise HotspotRefreshNeeded()
+                await _close_page(page)
+                await _cool_down(logger, f"WAF block at page {page_num}")
+                page = await _open_search_page(context)
+                empty_streak = 0
+                continue
 
             if result.get("error"):
                 err_msg = result["error"]
                 logger.warning("Fetch error at page %d: %s", page_num, err_msg)
-                # Any fetch error means the session is broken — refresh IP
-                raise HotspotRefreshNeeded()
+                if any(kw in str(err_msg) for kw in ("navigated", "timeout", "Target closed")):
+                    await _close_page(page)
+                    await _cool_down(logger, f"fetch error: {err_msg}")
+                    page = await _open_search_page(context)
+                    empty_streak = 0
+                    continue
+                # Unknown error — don't retry this area
+                break
 
             items = result.get("items", [])
             total_count = result.get("totalCount", 0)
@@ -649,6 +639,39 @@ async def _check_page_ok(page) -> bool:
         return True
     except Exception:
         return False
+
+
+async def _cool_down(logger, reason: str):
+    """Sleep COOLDOWN_SECONDS with progress logging every 3 min."""
+    logger.warning("Cooling down %ds (%s)...", COOLDOWN_SECONDS, reason)
+    remaining = COOLDOWN_SECONDS
+    while remaining > 0:
+        chunk = min(180, remaining)  # log every 3 minutes
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+        if remaining > 0:
+            logger.info("  Cooldown: %d min remaining...", remaining // 60)
+    logger.info("Cooldown done, reloading page...")
+
+
+async def _close_page(page):
+    """Safely close a page."""
+    try:
+        await page.close()
+    except Exception:
+        pass
+    return None
+
+
+async def _open_search_page(context):
+    """Create a fresh page and navigate to 51job search."""
+    new_page = await context.new_page()
+    await new_page.goto(
+        "https://we.51job.com/pc/search?keyword=%E6%9C%BA%E6%A2%B0%E5%B7%A5%E7%A8%8B%E5%B8%88&jobArea=000000",
+        wait_until="domcontentloaded",
+    )
+    await asyncio.sleep(4)
+    return new_page
 
 
 def _save_output(rows: list[dict]) -> None:

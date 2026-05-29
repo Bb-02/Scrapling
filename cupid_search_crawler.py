@@ -1,15 +1,15 @@
 """
-51job crawler using browser-internal fetch() API calls.
-Single browser process, persistent login, far fewer WAF issues.
+51job crawler using cupid.51job.com noauth search API.
+No browser, no login, no WAF slider. Pure HTTP requests.
 
 Usage:
-    python scrape_51job_fetch.py                     # full crawl
-    python scrape_51job_fetch.py --category 工程/机械  # specific category
-    python scrape_51job_fetch.py --no-scout           # skip scout pruning
+    python cupid_search_crawler.py                     # full crawl
+    python cupid_search_crawler.py --category 工程/机械  # specific category
+
+Shares progress with scrape_51job_fetch.py — same output dir, same format.
 """
 
 import argparse
-import asyncio
 import hashlib
 import hmac
 import json
@@ -23,7 +23,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import pandas as pd
-from playwright.async_api import async_playwright
+import requests
 
 # ============================================================
 # Constants
@@ -32,21 +32,13 @@ from playwright.async_api import async_playwright
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = SCRIPT_DIR.parent / "数据模板.xlsx"
 OUTPUT_DIR = SCRIPT_DIR.parent / "output"
-PROFILE_DIR = SCRIPT_DIR / "chrome_profile"
-PROGRESS_FILE = OUTPUT_DIR / "fetch_progress.json"
+PROGRESS_FILE = OUTPUT_DIR / "cupid_progress.json"
 
-HMAC_KEY = b"abfc8f9dcf8c3f3d8aa294ac5f2cf2cc7767e5592590f39c3f503271dd68562b"
-SEARCH_API_PATH = "/api/job/search-pc"
-MAX_PAGES = 20  # with pageSize=100, 20 pages = 2000 max per area
-PAGE_SIZE = 100
-DELAY_MIN = 0.5
-DELAY_MAX = 1.5
-CONSECUTIVE_EMPTY_THRESHOLD = 5  # trigger hotspot refresh after this many empty areas
-MAX_FETCHES_PER_IP = 40  # stop before WAF limit (~48), reconnect hotspot for new IP
-
-
-class HotspotRefreshNeeded(Exception):
-    """Raised when fetch count reaches MAX_FETCHES_PER_IP to request IP refresh."""
+API_URL = "https://cupid.51job.com/pc/open/noauth/search-h5"
+PAGE_SIZE = 200
+DELAY_SEC = 1.0  # between requests; lower = more empty responses
+MAX_EMPTY_RETRIES = 3  # retry empty responses before moving on
+MAX_PAGES = 50  # safety cap
 
 PROVINCE_CODES: dict[str, str] = {
     "北京": "010000", "上海": "020000", "天津": "030000", "重庆": "040000",
@@ -178,78 +170,17 @@ CATEGORIES: dict[str, list[str]] = {
     ],
 }
 
-
-def all_keywords() -> list[tuple[str, str]]:
-    """Return all (category, keyword) pairs."""
-    result = []
-    for cat, kws in CATEGORIES.items():
-        for kw in kws:
-            result.append((cat, kw))
-    return result
-
-
-# ============================================================
-# HMAC signature
-# ============================================================
-
-def build_signed_url(keyword: str, job_area: str, page_num: int = 1) -> str:
-    ts = str(int(time.time() * 1000))
-    params = {
-        "api_key": "51job", "timestamp": ts, "keyword": keyword,
-        "searchType": "2", "function": "", "industry": "",
-        "jobArea": job_area, "jobArea2": "", "landmark": "", "metro": "",
-        "salary": "", "workYear": "", "degree": "", "companyType": "",
-        "companySize": "", "jobType": "", "issueDate": "",
-        "sortType": "0", "pageNum": str(page_num), "pageSize": str(PAGE_SIZE),
-    }
-    qs = urlencode(params)
-    sig = hmac.new(HMAC_KEY, f"{SEARCH_API_PATH}?{qs}".encode(), hashlib.sha256).hexdigest()
-    return f"https://we.51job.com{SEARCH_API_PATH}?{qs}&signature={sig}"
-
-
-# ============================================================
-# fetch() JS
-# ============================================================
-
-FETCH_PAGE_JS = """
-async (args) => {
-    const url = args.url;
-    const timeoutMs = args.timeoutMs || 30000;
-    try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-        const resp = await fetch(url, {
-            credentials: 'include',
-            signal: controller.signal,
-            headers: {
-                'user-token': localStorage.getItem('token') || '',
-                'accept': 'application/json, text/plain, */*',
-            }
-        });
-        clearTimeout(timer);
-        const text = await resp.text();
-        if (text.includes('aliyun_waf')) {
-            return { waf: true };
-        }
-        if (!resp.headers.get('content-type')?.includes('json')) {
-            return { error: 'not_json', status: resp.status, preview: text.substring(0, 200) };
-        }
-        const data = JSON.parse(text);
-        const job = data?.resultbody?.job || {};
-        return {
-            items: job.items || [],
-            totalCount: job.totalCount || 0,
-            pageNum: job.pageNum || 0,
-        };
-    } catch(e) {
-        return { error: e.message || e.toString() };
-    }
-}
-"""
-
 # ============================================================
 # Data parsing
 # ============================================================
+
+def extract_job_id_from_url(url: str) -> str:
+    """Extract numeric job ID from URL for cross-API dedup."""
+    if not url:
+        return ""
+    m = re.search(r"/(\d+)\.html", url)
+    return m.group(1) if m else url
+
 
 def parse_location(job_area_string: str) -> tuple[str, str]:
     if not job_area_string:
@@ -290,8 +221,8 @@ def read_template_columns() -> list[str]:
 def build_row(idx: int, item: dict, category: str) -> dict:
     province, city = parse_location(item.get("jobAreaString", ""))
 
-    # welfare
-    welfare = item.get("welfareList", []) or item.get("jobWelfareCodeDataList", [])
+    # welfare — cupid uses jobWelfareCodeDataList
+    welfare = item.get("jobWelfareCodeDataList", []) or []
     if isinstance(welfare, list) and welfare:
         if isinstance(welfare[0], dict):
             welfare_str = " / ".join(
@@ -303,7 +234,7 @@ def build_row(idx: int, item: dict, category: str) -> dict:
         welfare_str = ""
 
     # tags
-    tags = item.get("jobTags", []) or item.get("jobTagsList", [])
+    tags = item.get("jobTags", []) or []
     if isinstance(tags, list):
         tags_str = " / ".join(
             t.get("jobTagName", "") if isinstance(t, dict) else str(t) for t in tags
@@ -311,24 +242,24 @@ def build_row(idx: int, item: dict, category: str) -> dict:
     else:
         tags_str = str(tags) if tags else ""
 
-    # industry — prefer string name over numeric ID
+    # industry
     func_types = []
-    for k in ("industryType1", "industryType2"):
-        v = item.get(k + "Str", "") or item.get(k, "")
+    for k in ("industryType1Str", "industryType2Str"):
+        v = item.get(k, "")
         if v and v not in func_types:
             func_types.append(v)
 
-    # description
+    # description — cupid has jobDescribe directly
     work_content, requirements = parse_job_description(
-        item.get("jobDescribe", "") or item.get("jobContent", "")
+        item.get("jobDescribe", "")
     )
 
+    # jobHref — cupid returns msearch.51job.com format
     job_href = item.get("jobHref", "")
     if not job_href:
         jid = item.get("jobId", "")
-        city_code = item.get("jobArea", "")
         if jid:
-            job_href = f"https://jobs.51job.com/{city_code}/{jid}.html"
+            job_href = f"https://jobs.51job.com/{jid}.html"
 
     return {
         "序号": idx,
@@ -338,18 +269,18 @@ def build_row(idx: int, item: dict, category: str) -> dict:
         "岗位名称": item.get("jobName", ""),
         "岗位类型\n企业/公务员/事业单位/军队文职": "企业",
         "公司名称": item.get("fullCompanyName", "") or item.get("companyName", ""),
-        "公司规模": item.get("companySize", "") or item.get("companySizeString", "/"),
+        "公司规模": item.get("companySizeString", "/"),
         "所在省份": province,
         "城市": city,
         "详细地址": item.get("jobAreaString", ""),
-        "学历要求": item.get("degree", "") or item.get("degreeString", "/"),
-        "经验要求": item.get("workYear", "") or item.get("workYearString", "/"),
-        "薪资范围": item.get("salary", "") or item.get("provideSalaryString", "/"),
+        "学历要求": item.get("degreeString", "/"),
+        "经验要求": item.get("workYearString", "/"),
+        "薪资范围": item.get("provideSalaryString", "/"),
         "福利标签": welfare_str or "/",
         "工作内容": work_content or "/",
         "任职要求": requirements or "/",
         "岗位链接": job_href,
-        "发布时间": item.get("issueDate", "") or item.get("issueDateString", ""),
+        "发布时间": item.get("issueDateString", ""),
         "投递起始时间": "/",
         "投递截止时间": "/",
         "证书要求": "/",
@@ -378,17 +309,78 @@ def save_progress(progress: dict) -> None:
 
 
 # ============================================================
+# API client
+# ============================================================
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://m.51job.com/",
+}
+
+
+def api_search(keyword: str, job_area: str, page_num: int,
+               page_size: int = PAGE_SIZE) -> dict:
+    """Call cupid search-h5 API. Returns {"items": [...], "totalCount": N} or empty dict."""
+    ts = str(int(time.time() * 1000))
+    params = {
+        "api_key": "51job",
+        "timestamp": ts,
+        "keyword": keyword,
+        "jobArea": job_area,
+        "pageNum": str(page_num),
+        "pageSize": str(page_size),
+        "searchType": "2",
+    }
+    try:
+        resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        job = data.get("resultbody", {}).get("job", {})
+        return {
+            "items": job.get("items") or [],
+            "totalCount": job.get("totalCount") or 0,
+        }
+    except Exception as e:
+        return {"items": [], "totalCount": 0, "error": str(e)}
+
+
+def api_search_with_retry(keyword: str, job_area: str, page_num: int,
+                           logger, max_retries: int = MAX_EMPTY_RETRIES) -> dict:
+    """Call API with retry on empty responses (silent throttling)."""
+    for attempt in range(max_retries + 1):
+        result = api_search(keyword, job_area, page_num)
+        if result.get("error"):
+            logger.warning("API error: %s (attempt %d/%d)",
+                          result["error"], attempt + 1, max_retries + 1)
+            if attempt < max_retries:
+                time.sleep(2.0)
+                continue
+            return result
+        if result["items"] or result["totalCount"] > 0:
+            if attempt > 0:
+                logger.info("  Retry #%d succeeded", attempt)
+            return result
+        if attempt < max_retries:
+            time.sleep(1.5)
+    return result
+
+
+# ============================================================
 # Main crawler
 # ============================================================
 
-async def crawl(
-    keywords: list[tuple[str, str]],  # [(category, keyword), ...]
-    areas: list[tuple[str, str]],     # [(name, code), ...]
+def crawl(
+    keywords: list[tuple[str, str]],
+    areas: list[tuple[str, str]],
     scout_areas: list[tuple[str, str]],
     no_scout: bool = False,
 ):
     logger = logging.getLogger("crawl")
-    PROFILE_DIR.mkdir(exist_ok=True)
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     progress = load_progress()
@@ -399,256 +391,153 @@ async def crawl(
     all_rows: list[dict] = progress.get("all_rows", [])
     seen_ids: set[str] = set(progress.get("seen_ids", []))
 
-    # Resume from saved output
+    # Resume from saved output — use jobId for dedup (cross-API compatible)
     resume_path = OUTPUT_DIR / "fetch_output.xlsx"
     if resume_path.exists() and not all_rows:
         try:
             df = pd.read_excel(resume_path)
             for _, row in df.iterrows():
                 d = row.to_dict()
-                jid = str(d.get("岗位链接", ""))
+                jid = extract_job_id_from_url(str(d.get("岗位链接", "")))
                 if jid and jid not in seen_ids:
                     seen_ids.add(jid)
                     all_rows.append(d)
             logger.info("Resumed %d rows from %s", len(all_rows), resume_path.name)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Could not resume from Excel: %s", e)
+
+    # Convert seen_ids to jobId-based if they contain old URLs
+    old_seen = list(seen_ids)
+    new_seen = set()
+    for sid in old_seen:
+        if "51job.com" in sid or ".html" in sid:
+            jid = extract_job_id_from_url(sid)
+            if jid:
+                new_seen.add(jid)
+        else:
+            new_seen.add(sid)
+    seen_ids = new_seen
 
     scout_codes = {c for _, c in scout_areas}
     full_areas = [(n, c) for n, c in areas if c not in scout_codes] if not no_scout else areas
 
-    async with async_playwright() as p:
-        logger.info("Launching browser (persistent profile: %s)", PROFILE_DIR)
-        context = await p.chromium.launch_persistent_context(
-            str(PROFILE_DIR),
-            headless=False,
-            channel="chrome",
-            viewport={"width": 1280, "height": 800},
-        )
-        page = await context.new_page()
+    total_kw = len(keywords)
+    logger.info("Starting cupid crawl: %d keywords, %d scout areas, %d full areas",
+                total_kw, len(scout_areas), len(full_areas))
+    logger.info("API: %s, pageSize=%d, delay=%.1fs", API_URL, PAGE_SIZE, DELAY_SEC)
 
-        # Open search page to establish WAF session
-        logger.info("Opening search page...")
-        await page.goto(
-            "https://we.51job.com/pc/search?keyword=%E6%9C%BA%E6%A2%B0%E5%B7%A5%E7%A8%8B%E5%B8%88&jobArea=000000",
-            wait_until="domcontentloaded",
-        )
-        await asyncio.sleep(5)
+    try:
+        while kw_idx < total_kw:
+            category, keyword = keywords[kw_idx]
+            logger.info("[%d/%d] category=%s keyword=%s phase=%s",
+                       kw_idx + 1, total_kw, category, keyword, phase)
 
-        has_token = await page.evaluate("() => !!localStorage.getItem('token')")
-        if not has_token:
-            print("\n[LOGIN REQUIRED] Please login in the browser, then press Enter...")
-            input()
-            await asyncio.sleep(3)
-            has_token = await page.evaluate("() => !!localStorage.getItem('token')")
-            if not has_token:
-                logger.error("Login failed. Exiting.")
-                await context.close()
-                return
-            logger.info("Login OK")
+            if phase == "scout":
+                before = len(all_rows)
+                crawl_areas(
+                    category, keyword, scout_areas,
+                    all_rows, seen_ids, logger,
+                )
+                progress["total"] = len(all_rows)
+                progress["seen_ids"] = list(seen_ids)
 
-        # Startup: if page is on WAF/captcha, IP is still blocked — reconnect hotspot
-        if not await _check_page_ok(page):
-            logger.error("Startup: page is on WAF/captcha! IP still blocked.")
-            logger.error("Reconnect hotspot for a new IP, then re-run.")
-            await context.close()
-            return
+                if no_scout or len(all_rows) > before:
+                    logger.info("Scout passed (+%d rows), starting full crawl",
+                               len(all_rows) - before)
+                    phase = "full"
+                    area_idx = 0
+                else:
+                    logger.info("Scout empty, skipping keyword")
+                    kw_idx += 1
+                    area_idx = 0
+                    phase = "scout"
+                progress.update(cat_idx=cat_idx, kw_idx=kw_idx,
+                               area_idx=area_idx, phase=phase)
 
-        job_items = await page.evaluate("() => document.querySelectorAll('.joblist-item').length")
-        logger.info("Page: %d job items, logged in: %s", job_items, has_token)
+            elif phase == "full":
+                remaining = full_areas[area_idx:]
+                last_ai = crawl_areas(
+                    category, keyword, remaining,
+                    all_rows, seen_ids, logger,
+                    area_offset=area_idx,
+                )
+                area_idx = area_idx + last_ai
+                if area_idx >= len(full_areas):
+                    kw_idx += 1
+                    area_idx = 0
+                    phase = "scout"
+                progress["total"] = len(all_rows)
+                progress["seen_ids"] = list(seen_ids)
+                progress.update(cat_idx=cat_idx, kw_idx=kw_idx,
+                               area_idx=area_idx, phase=phase)
 
-        # Main crawl loop
-        total_kw = len(keywords)
-        fetch_count = [0]  # mutable counter shared across _crawl_areas calls
-        area_idx_ref = [0]  # mutable tracker for current area index
-        logger.info("Starting crawl: %d keywords, %d scout areas, %d full areas",
-                    total_kw, len(scout_areas), len(full_areas))
-
-        try:
-            while kw_idx < total_kw:
-                category, keyword = keywords[kw_idx]
-                logger.info("[%d/%d] category=%s keyword=%s phase=%s",
-                           kw_idx + 1, total_kw, category, keyword, phase)
-
-                if phase == "scout":
-                    before = len(all_rows)
-                    page = await _crawl_areas(
-                        page, category, keyword, scout_areas,
-                        all_rows, seen_ids, logger,
-                        fetch_count=fetch_count,
-                    )
-                    progress["total"] = len(all_rows)
-                    progress["seen_ids"] = list(seen_ids)
-
-                    if no_scout or len(all_rows) > before:
-                        logger.info("Scout passed (+%d rows), starting full crawl",
-                                   len(all_rows) - before)
-                        phase = "full"
-                        area_idx = 0
-                    else:
-                        logger.info("Scout empty, skipping keyword")
-                        kw_idx += 1
-                        area_idx = 0
-                        phase = "scout"
-                    progress.update(cat_idx=cat_idx, kw_idx=kw_idx,
-                                   area_idx=area_idx, phase=phase)
-
-                elif phase == "full":
-                    # Resume from saved area_idx, don't repeat completed areas
-                    remaining = full_areas[area_idx:]
-                    page = await _crawl_areas(
-                        page, category, keyword, remaining,
-                        all_rows, seen_ids, logger,
-                        fetch_count=fetch_count,
-                        area_idx_ref=area_idx_ref,
-                        area_offset=area_idx,
-                    )
-                    area_idx = area_idx + area_idx_ref[0] + 1  # +1 past the last processed
-                    if area_idx >= len(full_areas):
-                        kw_idx += 1
-                        area_idx = 0
-                        phase = "scout"
-                    progress["total"] = len(all_rows)
-                    progress["seen_ids"] = list(seen_ids)
-                    progress.update(cat_idx=cat_idx, kw_idx=kw_idx,
-                                   area_idx=area_idx, phase=phase)
-
-                # Auto-save every keyword
-                save_progress(progress)
-                _save_output(all_rows)
-                logger.info("Saved: %d total rows", len(all_rows))
-
-        except HotspotRefreshNeeded:
-            logger.warning("IP refresh needed. Saving progress...")
-            # Use accurate area_idx from the tracker
-            saved_area = area_idx_ref[0] if phase == "full" else area_idx
-            progress.update(cat_idx=cat_idx, kw_idx=kw_idx, area_idx=saved_area, phase=phase)
-            progress["total"] = len(all_rows)
-            progress["seen_ids"] = list(seen_ids)
+            # Auto-save every keyword
             save_progress(progress)
             _save_output(all_rows)
-            logger.info("=" * 60)
-            logger.info("Reconnect hotspot now for a new IP, then re-run:")
-            logger.info("  python scrape_51job_fetch.py")
-            logger.info("=" * 60)
-        except KeyboardInterrupt:
-            logger.warning("Interrupted. Saving progress...")
-            saved_area = area_idx_ref[0] if phase == "full" else area_idx
-            progress.update(cat_idx=cat_idx, kw_idx=kw_idx, area_idx=saved_area, phase=phase)
-            progress["total"] = len(all_rows)
-            progress["seen_ids"] = list(seen_ids)
-            save_progress(progress)
-            _save_output(all_rows)
-            logger.info("Progress saved. Resume with: python scrape_51job_fetch.py")
-        finally:
-            await context.close()
+            logger.info("Saved: %d total rows", len(all_rows))
+
+    except KeyboardInterrupt:
+        logger.warning("Interrupted. Saving progress...")
+        progress["total"] = len(all_rows)
+        progress["seen_ids"] = list(seen_ids)
+        save_progress(progress)
+        _save_output(all_rows)
+        logger.info("Progress saved. Resume with: python cupid_search_crawler.py")
 
     _save_output(all_rows)
     logger.info("Done! Total: %d rows", len(all_rows))
 
 
-async def _crawl_areas(
-    page, category: str, keyword: str, areas: list[tuple[str, str]],
+def crawl_areas(
+    category: str, keyword: str, areas: list[tuple[str, str]],
     all_rows: list[dict], seen_ids: set[str], logger,
-    fetch_count: list[int] | None = None,
-    area_idx_ref: list[int] | None = None,
     area_offset: int = 0,
-):
-    empty_streak = 0
+) -> int:
+    """Crawl areas for one keyword. Returns last area index processed (relative)."""
+    request_count = 0
+    empty_areas = 0
 
     for ai, (area_name, area_code) in enumerate(areas):
-        if area_idx_ref is not None:
-            area_idx_ref[0] = area_offset + ai
-        logger.info("  [%d/%d] %s @ %s(%s)", area_offset + ai + 1, area_offset + len(areas), keyword, area_name, area_code)
+        logger.info("  [%d/%d] %s @ %s(%s)",
+                   area_offset + ai + 1, area_offset + len(areas),
+                   keyword, area_name, area_code)
 
         for page_num in range(1, MAX_PAGES + 1):
-            if empty_streak >= CONSECUTIVE_EMPTY_THRESHOLD:
-                logger.info("  %d consecutive empty areas — IP might be throttled, saving & exiting",
-                           empty_streak)
-                raise HotspotRefreshNeeded()
-
-            # Check if page is still on 51job before fetching
-            if not await _check_page_ok(page):
-                logger.warning("Page redirected to WAF/captcha — refreshing IP")
-                raise HotspotRefreshNeeded()
-
-            url = build_signed_url(keyword, area_code, page_num)
-            delay = random.uniform(DELAY_MIN, DELAY_MAX)
-            await asyncio.sleep(delay)
-
-            result = await _safe_fetch(page, url)
-
-            if fetch_count is not None:
-                fetch_count[0] += 1
-                if fetch_count[0] >= MAX_FETCHES_PER_IP:
-                    logger.warning("Reached %d fetches — refresh hotspot for new IP",
-                                   fetch_count[0])
-                    raise HotspotRefreshNeeded()
-
-            if result.get("waf"):
-                logger.warning("WAF block in fetch response — refreshing IP")
-                raise HotspotRefreshNeeded()
-
-            if result.get("error"):
-                err_msg = result["error"]
-                logger.warning("Fetch error at page %d: %s", page_num, err_msg)
-                # Any fetch error means the session is broken — refresh IP
-                raise HotspotRefreshNeeded()
+            result = api_search_with_retry(keyword, area_code, page_num, logger)
+            request_count += 1
 
             items = result.get("items", [])
             total_count = result.get("totalCount", 0)
 
             if not items:
-                empty_streak += 1
-                break  # no more results for this area
+                empty_areas += 1
+                break
 
-            empty_streak = 0  # reset streak on success
+            empty_areas = 0
 
             new_count = 0
             for item in items:
-                jid = item.get("jobHref", "") or str(item.get("jobId", ""))
+                jid = str(item.get("jobId", ""))
                 if jid and jid not in seen_ids:
                     seen_ids.add(jid)
                     all_rows.append(build_row(len(all_rows) + 1, item, category))
                     new_count += 1
 
-            # If we got fewer items than page_size or reached total_count, stop paginating
             if len(items) < PAGE_SIZE:
                 break
             if total_count and page_num * PAGE_SIZE >= total_count:
                 break
 
+            time.sleep(DELAY_SEC)
+
         # Brief pause between areas
-        await asyncio.sleep(random.uniform(1.0, 2.0))
+        time.sleep(random.uniform(0.5, 1.0))
 
-    return page  # may have been replaced after cooldown
+        # Progress report every 10 areas
+        if request_count > 0 and request_count % 10 == 0:
+            logger.info("  ... %d requests, %d total rows", request_count, len(all_rows))
 
-
-async def _safe_fetch(page, url: str, timeout_ms: int = 30000) -> dict:
-    try:
-        return await asyncio.wait_for(
-            page.evaluate(FETCH_PAGE_JS, {"url": url, "timeoutMs": timeout_ms}),
-            timeout=(timeout_ms / 1000) + 5,  # Python timeout slightly longer than JS
-        )
-    except asyncio.TimeoutError:
-        return {"error": "fetch_timeout"}
-    except Exception as e:
-        msg = str(e)
-        if "navigation" in msg.lower() or "destroyed" in msg.lower():
-            return {"error": "page_navigated"}
-        return {"error": msg[:100]}
-
-async def _check_page_ok(page) -> bool:
-    """Return False if page has been redirected to WAF/captcha."""
-    try:
-        url = page.url
-        if "aliyun" in url.lower() or "cfjet" in url.lower() or "challenge" in url.lower():
-            return False
-        if "we.51job.com" not in url:
-            return False
-        return True
-    except Exception:
-        return False
+    return len(areas)
 
 
 def _save_output(rows: list[dict]) -> None:
@@ -661,7 +550,6 @@ def _save_output(rows: list[dict]) -> None:
     path = OUTPUT_DIR / f"fetch_output_{stamp}.xlsx"
     df.to_excel(path, index=False, sheet_name="Sheet1")
 
-    # Also save as latest for resume
     latest = OUTPUT_DIR / "fetch_output.xlsx"
     df.to_excel(latest, index=False, sheet_name="Sheet1")
 
@@ -670,20 +558,21 @@ def _save_output(rows: list[dict]) -> None:
 # Entry point
 # ============================================================
 
-def main():
-    parser = argparse.ArgumentParser(description="51job fetch-based crawler")
-    parser.add_argument("--category", type=str, default=None,
-                       help="Category name (default: all)")
-    parser.add_argument("--keywords", type=str, nargs="*", default=None,
-                       help="Specific keywords (overrides category)")
-    parser.add_argument("--no-scout", action="store_true", default=False)
-    parser.add_argument("--delay-min", type=float, default=0.5)
-    parser.add_argument("--delay-max", type=float, default=1.5)
-    args = parser.parse_args()
+def all_keywords() -> list[tuple[str, str]]:
+    result = []
+    for cat, kws in CATEGORIES.items():
+        for kw in kws:
+            result.append((cat, kw))
+    return result
 
-    global DELAY_MIN, DELAY_MAX
-    DELAY_MIN = args.delay_min
-    DELAY_MAX = args.delay_max
+
+def main():
+    parser = argparse.ArgumentParser(description="51job cupid API crawler")
+    parser.add_argument("--category", type=str, default=None)
+    parser.add_argument("--keywords", type=str, nargs="*", default=None)
+    parser.add_argument("--no-scout", action="store_true", default=False)
+    parser.add_argument("--delay", type=float, default=DELAY_SEC)
+    args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -694,30 +583,29 @@ def main():
     )
     logger = logging.getLogger("crawl")
 
-    # Build keyword list
     if args.keywords:
         keywords = [(args.category or "未分类", kw) for kw in args.keywords]
     elif args.category and args.category in CATEGORIES:
         keywords = [(args.category, kw) for kw in CATEGORIES[args.category]]
     elif args.category:
-        logger.error("Unknown category: %s. Available: %s", args.category, list(CATEGORIES.keys()))
+        logger.error("Unknown category: %s. Available: %s",
+                    args.category, list(CATEGORIES.keys()))
         return
     else:
         keywords = all_keywords()
 
-    # Build area list
     areas = list(PROVINCE_CODES.items())
     scout_areas = [] if args.no_scout else SCOUT_AREAS
 
     logger.info("=" * 60)
-    logger.info("51job Fetch Crawler")
+    logger.info("51job Cupid Crawler (noauth)")
     logger.info("  Keywords: %d", len(keywords))
     logger.info("  Areas: %d provinces + %d scout", len(areas), len(scout_areas))
-    logger.info("  Delay: %.1f-%.1fs between requests", DELAY_MIN, DELAY_MAX)
+    logger.info("  API: %s", API_URL)
     logger.info("  Scout pruning: %s", "OFF" if args.no_scout else "ON")
     logger.info("=" * 60)
 
-    asyncio.run(crawl(keywords, areas, scout_areas, args.no_scout))
+    crawl(keywords, areas, scout_areas, args.no_scout)
 
 
 if __name__ == "__main__":
