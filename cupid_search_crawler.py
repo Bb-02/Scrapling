@@ -36,11 +36,13 @@ PROGRESS_FILE = OUTPUT_DIR / "cupid_progress.json"
 
 API_URL = "https://cupid.51job.com/pc/open/noauth/search-h5"
 PAGE_SIZE = 200
-DELAY_SEC = 1.5  # safe rate for continuous running (never triggers WAF)
+DELAY_SEC = 2.0  # safe rate for continuous running (never triggers WAF)
 MAX_EMPTY_RETRIES = 3  # retry empty responses before moving on
 MAX_PAGES = 50  # safety cap
 COOLDOWN_SECONDS = 2100  # 35 min wait when WAF blocks (WAF Max-Age=1800s, add margin)
 MAX_CONSECUTIVE_COOLDOWNS = 3  # exit if blocked this many times in a row
+CYCLE_CRAWL_SECONDS = 2400  # 40 min: crawl before taking a break
+CYCLE_REST_SECONDS = 600    # 10 min: rest to reset WAF timer
 
 
 class WafBlocked(Exception):
@@ -329,8 +331,25 @@ def load_progress() -> dict:
             "cat_idx": 0, "kw_idx": 0, "area_idx": 0,
             "phase": "scout", "total": 0, "seen_ids": [],
         }
-    with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        logging.getLogger("crawl").warning(
+            "Progress file corrupt, trying recovery..."
+        )
+        for suffix in (".tmp", ".bak"):
+            recovery = Path(str(PROGRESS_FILE) + suffix)
+            if recovery.exists():
+                try:
+                    with open(recovery, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    pass
+        return {
+            "cat_idx": 0, "kw_idx": 0, "area_idx": 0,
+            "phase": "scout", "total": 0, "seen_ids": [],
+        }
 
 
 def save_progress(progress: dict) -> None:
@@ -344,8 +363,11 @@ def save_progress(progress: dict) -> None:
         "total": progress.get("total", 0),
         "seen_ids": progress.get("seen_ids", []),
     }
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+    tmp = Path(str(PROGRESS_FILE) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(slim, f, ensure_ascii=False, indent=2)
+    # Atomic rename — crash during write() leaves main intact
+    tmp.replace(PROGRESS_FILE)
 
 
 # ============================================================
@@ -441,23 +463,42 @@ def crawl(
     all_rows: list[dict] = progress.get("all_rows", [])
     seen_ids: set[str] = set(progress.get("seen_ids", []))
 
-    # Resume from saved output — use jobId for dedup
+    # Resume from saved output — try main first, fall back to largest backup
     resume_path = OUTPUT_DIR / "cupid_output.xlsx"
-    if resume_path.exists() and not all_rows:
+    if resume_path.exists():
         try:
             df = pd.read_excel(resume_path)
-            for _, row in df.iterrows():
-                d = row.to_dict()
-                jid = extract_job_id_from_url(str(d.get("岗位链接", "")))
-                if jid and jid not in seen_ids:
-                    seen_ids.add(jid)
-                    all_rows.append(d)
-            # Fix indices after resume
-            for i, row in enumerate(all_rows):
-                row["序号"] = i + 1
-            logger.info("Resumed %d rows from %s", len(all_rows), resume_path.name)
-        except Exception as e:
-            logger.warning("Could not resume from Excel: %s", e)
+            if len(df) < 1000:  # too small → corrupted, try backup
+                resume_path = None
+        except Exception:
+            resume_path = None
+    if resume_path is None:
+        # Main file missing/corrupt — find largest backup by file size
+        backups = sorted(OUTPUT_DIR.glob("cupid_output_20*.xlsx"),
+                         key=lambda x: x.stat().st_size, reverse=True)
+        for bk in backups[:2]:
+            try:
+                df = pd.read_excel(bk)
+                if len(df) > 1000:
+                    resume_path = bk
+                    break
+            except Exception:
+                continue
+    if resume_path is None:
+        logger.warning("No valid Excel found — starting fresh")
+    if resume_path and not all_rows:
+        df = pd.read_excel(resume_path)
+        for _, row in df.iterrows():
+            d = row.to_dict()
+            jid = extract_job_id_from_url(str(d.get("岗位链接", "")))
+            if jid and jid not in seen_ids:
+                seen_ids.add(jid)
+                all_rows.append(d)
+        for i, row in enumerate(all_rows):
+            row["序号"] = i + 1
+        logger.info("Resumed %d rows from %s", len(all_rows), resume_path.name)
+    elif not all_rows:
+        logger.warning("No valid Excel found to resume from — starting fresh")
 
     # Convert seen_ids to jobId-based if they contain old URLs
     old_seen = list(seen_ids)
@@ -480,6 +521,7 @@ def crawl(
     logger.info("API: %s, pageSize=%d, delay=%.1fs", API_URL, PAGE_SIZE, DELAY_SEC)
 
     cooldown_streak = 0
+    cycle_start = time.time()  # for 40-min crawl / 10-min rest cycle
 
     try:
         while kw_idx < total_kw:
@@ -533,6 +575,20 @@ def crawl(
                 _save_output(all_rows)
                 logger.info("Saved: %d total rows", len(all_rows))
 
+                # Cycle rest: 40 min crawl → 10 min break to avoid WAF
+                if time.time() - cycle_start > CYCLE_CRAWL_SECONDS:
+                    logger.info(
+                        "Cycle rest: crawling for %.0f min, pausing %.0f min...",
+                        (time.time() - cycle_start) / 60, CYCLE_REST_SECONDS / 60,
+                    )
+                    remaining_rest = CYCLE_REST_SECONDS
+                    while remaining_rest > 0:
+                        chunk = min(60, remaining_rest)
+                        time.sleep(chunk)
+                        remaining_rest -= chunk
+                    cycle_start = time.time()
+                    logger.info("Cycle rest done, resuming...")
+
             except WafBlocked:
                 progress["total"] = len(all_rows)
                 progress["seen_ids"] = list(seen_ids)
@@ -562,6 +618,7 @@ def crawl(
                     time.sleep(chunk)
                     remaining_sleep -= chunk
                 logger.info("Cooldown done, resuming...")
+                cycle_start = time.time()  # reset cycle timer after cooldown
 
     except KeyboardInterrupt:
         logger.warning("Interrupted. Saving progress...")
@@ -584,6 +641,7 @@ def crawl_areas(
 ) -> int:
     """Crawl areas for one keyword. Returns number of areas processed."""
     request_count = 0
+    last_req = 0.0  # timestamp of last request, for rate limiting
 
     for ai, (area_name, area_code) in enumerate(areas):
         logger.info("  [%d/%d] %s @ %s(%s)",
@@ -591,7 +649,13 @@ def crawl_areas(
                    keyword, area_name, area_code)
 
         for page_num in range(1, MAX_PAGES + 1):
+            # Rate limit: ensure at least DELAY_SEC between requests
+            gap = time.time() - last_req
+            if gap < DELAY_SEC:
+                time.sleep(DELAY_SEC - gap)
+
             result = api_search_with_retry(keyword, area_code, page_num, logger)
+            last_req = time.time()
             request_count += 1
 
             if result.get("waf"):
@@ -617,11 +681,6 @@ def crawl_areas(
             if total_count and page_num * PAGE_SIZE >= total_count:
                 break
 
-            time.sleep(DELAY_SEC)
-
-        # Brief pause between areas
-        time.sleep(random.uniform(0.5, 1.0))
-
         # Progress report every 10 areas
         if request_count > 0 and request_count % 10 == 0:
             logger.info("  ... %d requests, %d total rows", request_count, len(all_rows))
@@ -636,11 +695,15 @@ def _save_output(rows: list[dict]) -> None:
     columns = read_template_columns()
     df = pd.DataFrame(rows, columns=columns)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 1) timestamped snapshot (safe — never overwritten except by next snapshot)
     path = OUTPUT_DIR / f"cupid_output_{stamp}.xlsx"
     df.to_excel(path, index=False, sheet_name="Sheet1")
 
+    # 2) atomic main file: write to .tmp then rename
     latest = OUTPUT_DIR / "cupid_output.xlsx"
-    df.to_excel(latest, index=False, sheet_name="Sheet1")
+    tmp = OUTPUT_DIR / "cupid_output.xlsx.tmp"
+    df.to_excel(tmp, index=False, sheet_name="Sheet1")
+    tmp.replace(latest)
 
 
 # ============================================================
